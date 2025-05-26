@@ -6,7 +6,7 @@ toolchain go1.24.2
 
 require (
 	github.com/refraction-networking/utls v1.7.0
-	github.com/xtaci/kcp-go v5.4.20+incompatible
+	github.com/stretchr/testify v1.10.0
 	github.com/xtaci/kcp-go/v5 v5.6.20
 	github.com/xtaci/smux v1.5.34
 	golang.org/x/net v0.39.0
@@ -24,10 +24,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/stretchr/testify v1.10.0 // indirect
 	github.com/templexxx/cpu v0.1.1 // indirect
-	github.com/templexxx/cpufeat v0.0.0-20180724012125-cef66df7f161 // indirect
-	github.com/templexxx/xor v0.0.0-20191217153810-f85b25db303b // indirect
 	github.com/templexxx/xorsimd v0.4.3 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	golang.org/x/crypto v0.37.0 // indirect
