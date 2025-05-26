@@ -4,7 +4,8 @@
 //
 // package dnstt-client
 // ///////////////////////////////////////////////////////////
-// /////    This file is unmodified from the original    /////
+// /////    This file has one change from the original   /////
+// /////    Line: 66 -> fix panic for '\' at eol         /////
 // ///////////////////////////////////////////////////////////
 package dnstt
 
@@ -62,7 +63,7 @@ func parseWeightedList(s string) ([]uint32, []string, error) {
 			if s[i] == '\\' {
 				i++
 				if !(i < len(s)) {
-					return token{Kind: kindError, Text: fmt.Sprintf("%q at end of string", s[i])}
+					return token{Kind: kindError, Text: "\"\\\" at end of string"} // modified: original paniced when it saw a backslash at the end
 				}
 			}
 			text.WriteByte(s[i])

@@ -4,7 +4,8 @@
 //
 // package dnstt-client
 // ///////////////////////////////////////////////////////////
-// /////    This file is unmodified from the original    /////
+// /////    This file has one change from the original   /////
+// /////    Line: 66 -> add test case for '\' eol        /////
 // ///////////////////////////////////////////////////////////
 package dnstt
 
@@ -62,6 +63,7 @@ func TestParseWeightedList(t *testing.T) {
 		"5*apple*5",
 		"-5*apple",
 		"5.5*apple",
+		"apple\\", // added to test trailing backslash
 	} {
 		_, _, err := parseWeightedList(input)
 		if err == nil {
