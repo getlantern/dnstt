@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/xtaci/kcp-go"
+	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
@@ -39,7 +39,7 @@ func newSession(pconn net.PacketConn, mtu int, pubKey []byte) (sess *smux.Sessio
 	)
 	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 	if conn.SetMtu(mtu) {
-		return nil, fmt.Errorf("setting MTU %d: %w", mtu, err)
+		return nil, fmt.Errorf("setting MTU %d", mtu)
 	}
 
 	// Put a Noise channel on top of the KCP conn.
