@@ -190,7 +190,7 @@ func WithDomainRoot(domain string) Option {
 			return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
 		}
 
-		slog.Debug("effective MTU", strconv.Itoa(mtu))
+		slog.Debug("effective MTU", "mtu", strconv.Itoa(mtu))
 		d.mtu = mtu
 		return nil
 	}
@@ -214,7 +214,7 @@ func WithPublicKey(key string) Option {
 func WithUTLSDistribution(distribution string) Option {
 	return func(d *dnstt) error {
 		if d.clientHelloID != nil {
-			return fmt.Errorf("ClientHelloID already set to %s", d.clientHelloID)
+			return fmt.Errorf("ClientHelloID already set to %v", d.clientHelloID)
 		}
 		utlsClientHelloID, err := sampleUTLSDistribution(distribution)
 		if err != nil {
@@ -230,7 +230,7 @@ func WithUTLSDistribution(distribution string) Option {
 func WithUTLSClientHelloID(hello *utls.ClientHelloID) Option {
 	return func(d *dnstt) error {
 		if d.clientHelloID != nil {
-			return fmt.Errorf("ClientHelloID already set to %s", d.clientHelloID)
+			return fmt.Errorf("ClientHelloID already set to %v", d.clientHelloID)
 		}
 		d.clientHelloID = hello
 		return nil
