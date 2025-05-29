@@ -43,7 +43,7 @@ dnstt$ cd server
 dnstt$ go build -o dnstt-server
 ```
 
-### Key Gneration
+### Key Generation
 
 First you need to generate the server keypair that will be used to
 authenticate the server and encrypt the tunnel.
