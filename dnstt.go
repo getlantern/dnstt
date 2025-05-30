@@ -141,43 +141,51 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 // Option is a function type used to configure the dnstt instance.
 type Option func(*dnstt) error
 
-// WithDoH configures the dnstt instance to use DNS-over-HTTPS (DoH) with the specified URL.
-func WithDoH(urlStr string) Option {
+// WithDoH configures the client to send requests using DNS-over-HTTPS (DoH) through the specified
+// public resolver URL.
+//
+// A list of public DNS servers that support DoH can be found at:
+// https://github.com/curl/curl/wiki/DNS-over-HTTPS#publicly-available-servers
+func WithDoH(resolverURL string) Option {
 	return func(d *dnstt) error {
 		if d.transport != nil {
 			return fmt.Errorf("transport already set to %s", d.transport)
 		}
-		_, err := url.Parse(urlStr)
+		_, err := url.Parse(resolverURL)
 		if err != nil {
 			return fmt.Errorf("invalid DoH URL: %w", err)
 		}
-		slog.Info("using DoH", "url", urlStr)
-		d.transport = &dohDialer{url: urlStr}
+		slog.Info("using DoH", "url", resolverURL)
+		d.transport = &dohDialer{url: resolverURL}
 		return nil
 	}
 }
 
-// WithDoT configures the dnstt instance to use DNS-over-TLS (DoT) with the specified address.
-func WithDoT(addr string) Option {
+// WithDoT configures the client to send requests using DNS-over-TLS (DoT) through the specified
+// public resolver address ("host:port").
+//
+// A list of public DNS servers that support DoT can be found at:
+// https://dnsprivacy.org/public_resolvers/#dns-over-tls-dot
+func WithDoT(resolverAddr string) Option {
 	return func(d *dnstt) error {
 		if d.transport != nil {
 			return fmt.Errorf("transport already set to %s", d.transport)
 		}
-		_, _, err := net.SplitHostPort(addr)
+		_, _, err := net.SplitHostPort(resolverAddr)
 		if err != nil {
 			return fmt.Errorf("invalid DoT address: %w", err)
 		}
-		slog.Info("using DoT", "addr", addr)
-		d.transport = &dotDialer{addr: addr}
+		slog.Info("using DoT", "addr", resolverAddr)
+		d.transport = &dotDialer{addr: resolverAddr}
 		return nil
 	}
 }
 
-// WithDomainRoot sets the root of the DNS zone reserved for the tunnel.
+// WithTunnelDomain sets the base domain name used for the DNS tunnel.
 //
-// Note: the domain is used to calculate the maximum transmission unit (MTU) for the tunnel. Longer
-// domains leave less space for the payload.
-func WithDomainRoot(domain string) Option {
+// This should match the subdomain delegated to the tunnel server, as
+// described in the DNS setup instructions.
+func WithTunnelDomain(domain string) Option {
 	return func(d *dnstt) error {
 		domain, err := dns.ParseName(domain)
 		if err != nil {
