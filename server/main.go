@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -751,6 +752,48 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
+func runIPTablesCmd(cmd, arg string) error {
+	c := exec.Command(cmd, arg)
+	if output, err := c.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to run %s %s: %w, output: %s", cmd, arg, err, output)
+	}
+	return nil
+}
+
+// setupIPTables sets up the iptables rules to redirect incoming DNS queries to specified port.
+func setupIPTables(port string) error {
+	// remove rules in case they already exist
+	cleanupIPTables(port)
+
+	// IPv4
+	if err := runIPTablesCmd("iptables", "-I INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+		return err
+	}
+	if err := runIPTablesCmd("iptables", "-t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port); err != nil {
+		return err
+	}
+	// IPv6
+	if err := runIPTablesCmd("ip6tables", "-I INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+		return err
+	}
+	return runIPTablesCmd("ip6tables", "-t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port)
+}
+
+func cleanupIPTables(port string) error {
+	// IPv4
+	if err := runIPTablesCmd("iptables", "-D INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+		return err
+	}
+	if err := runIPTablesCmd("iptables", "-t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port); err != nil {
+		return err
+	}
+	// IPv6
+	if err := runIPTablesCmd("ip6tables", "-D INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+		return err
+	}
+	return runIPTablesCmd("ip6tables", "-t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port)
+}
+
 func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	defer dnsConn.Close()
 
@@ -781,6 +824,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 		return fmt.Errorf("opening KCP listener: %v", err)
 	}
 	defer ln.Close()
+
 	go func() {
 		err := acceptSessions(ln, privkey, mtu)
 		if err != nil {
@@ -864,6 +908,15 @@ Example:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "opening UDP listener: %v\n", err)
 			os.Exit(1)
+		}
+
+		_, udpPort, _ := net.SplitHostPort(udpAddr)
+		if udpPort != "53" {
+			if err := setupIPTables(udpPort); err != nil {
+				fmt.Fprintf(os.Stderr, "cannot set up iptables: %v\n", err)
+				os.Exit(1)
+			}
+			defer cleanupIPTables(udpPort)
 		}
 
 		if pubkeyFilename != "" {
