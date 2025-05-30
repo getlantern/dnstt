@@ -65,7 +65,10 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 	}
 
 	if dnstt.clientHelloID == nil {
-		slog.Info("ClientHelloID not set, using default utls distribution to generate one", "distribution", defaultUTLSDistribution)
+		slog.Info(
+			"ClientHelloID not set, using default utls distribution to generate one",
+			"distribution", defaultUTLSDistribution,
+		)
 		if err := WithUTLSDistribution(defaultUTLSDistribution)(dnstt); err != nil {
 			return nil, fmt.Errorf("applying default utls distribution: %w", err)
 		}
@@ -126,7 +129,7 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 	sess, err := newSession(pconn, d.mtu, d.publicKey)
 	if err != nil {
 		pconn.Close()
-		return nil, fmt.Errorf("creating session: %w:", err)
+		return nil, fmt.Errorf("creating session: %w", err)
 	}
 	conn, err := sess.OpenStream()
 	if err != nil {
