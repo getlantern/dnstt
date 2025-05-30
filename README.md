@@ -61,14 +61,6 @@ dnstt-server -udp :5300 -privkey-file server.key t.example.com
 ```
 
 The tunnel server needs to be able to receive packets on an external
-port 53. You can have it listen on port 53 directly using `-udp :53`,
-but that requires the program to run as root. It is better to run the
-program as an ordinary user and have it listen on an unprivileged port
-(`:5300` above), and port-forward port 53 to it. On Linux, use these
-commands to forward external port 53 to localhost port 5300:
-```sh
-sudo iptables -I INPUT -p udp --dport 5300 -j ACCEPT
-sudo iptables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300
-sudo ip6tables -I INPUT -p udp --dport 5300 -j ACCEPT
-sudo ip6tables -t nat -I PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300
-```
+port 53. If it is not configured to listen on port 53 directly using 
+`-udp :53`, it will automatically setup iptables rules to port-forward
+port 53 to it.
