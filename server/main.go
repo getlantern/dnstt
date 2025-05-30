@@ -814,7 +814,7 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
   %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE DOMAIN UPSTREAMADDR
+  %[1]s -udp ADDR -privkey-file PRIVKEYFILE DOMAIN
 
 Example:
   %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
@@ -845,7 +845,8 @@ Example:
 		}
 	} else {
 		// Ordinary server mode.
-		if flag.NArg() != 2 {
+		if flag.NArg() != 1 {
+			fmt.Fprintf(os.Stderr, "exactly one domain name argument is required\n")
 			flag.Usage()
 			os.Exit(1)
 		}
