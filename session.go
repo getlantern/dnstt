@@ -38,8 +38,8 @@ func newSession(pconn net.PacketConn, mtu int, pubKey []byte) (sess *smux.Sessio
 		1, // nc=1 => congestion window off
 	)
 	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-	if conn.SetMtu(mtu) {
-		return nil, fmt.Errorf("setting MTU %d", mtu)
+	if !conn.SetMtu(mtu) {
+		return nil, fmt.Errorf("setting MTU to %d", mtu)
 	}
 
 	// Put a Noise channel on top of the KCP conn.
