@@ -1,14 +1,20 @@
 package dnstt
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
+	"net/http"
+	"os"
 	"testing"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // Mock implementations for dependencies
@@ -47,4 +53,42 @@ func TestDNSTT_NewRoundTripper(t *testing.T) {
 	_, err := dnstt.NewRoundTripper(context.Background(), "example.com")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dial error")
+}
+
+func TestRoundTripperE2E(t *testing.T) {
+	slog.SetDefault(slog.New(slog.NewTextHandler(
+		os.Stdout,
+		&slog.HandlerOptions{
+			AddSource: true,
+		},
+	)))
+
+	resolver := "https://cloudflare-dns.com/dns-query"
+	domain := "t.iantem.io"
+
+	key, err := os.ReadFile("server.pub")
+	require.NoError(t, err)
+	key = bytes.TrimSpace(key)
+
+	dt, err := NewDNSTT(
+		WithTunnelDomain(domain),
+		WithDoH(resolver),
+		WithPublicKey(string(key)),
+	)
+	require.NoError(t, err)
+	rt, err := dt.NewRoundTripper(context.Background(), "")
+	require.NoError(t, err)
+
+	req, err := http.NewRequest("GET", "https://ipconfig.io", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, resp.StatusCode, http.StatusOK)
+
+	buf, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	t.Logf("Response: %s", buf)
 }
