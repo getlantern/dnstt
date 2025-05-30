@@ -752,10 +752,11 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func runIPTablesCmd(cmd, arg string) error {
-	c := exec.Command(cmd, arg)
+func runIPTablesCmd(cmd string, args ...string) error {
+	c := exec.Command(cmd, args...)
 	if output, err := c.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to run %s %s: %w, output: %s", cmd, arg, err, output)
+		cmd = cmd + " " + strings.Join(args, " ")
+		return fmt.Errorf("failed to run %q: %w, output: %s", cmd, err, output)
 	}
 	return nil
 }
@@ -766,38 +767,36 @@ func setupIPTables(port string) error {
 	cleanupIPTables(port)
 
 	// IPv4
-	if err := runIPTablesCmd("iptables", "-I INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+	if err := runIPTablesCmd("iptables", "-I", "INPUT", "-p", "udp", "--dport", port, "-j", "ACCEPT"); err != nil {
 		return err
 	}
-	if err := runIPTablesCmd("iptables", "-t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port); err != nil {
+	if err := runIPTablesCmd("iptables", "-t", "nat", "-I", "PREROUTING", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", port); err != nil {
 		return err
 	}
 	// IPv6
-	if err := runIPTablesCmd("ip6tables", "-I INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+	if err := runIPTablesCmd("ip6tables", "-I", "INPUT", "-p", "udp", "--dport", port, "-j", "ACCEPT"); err != nil {
 		return err
 	}
-	return runIPTablesCmd("ip6tables", "-t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port)
+	return runIPTablesCmd("ip6tables", "-t", "nat", "-I", "PREROUTING", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", port)
 }
 
 func cleanupIPTables(port string) error {
 	// IPv4
-	if err := runIPTablesCmd("iptables", "-D INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+	if err := runIPTablesCmd("iptables", "-D", "INPUT", "-p", "udp", "--dport", port, "-j", "ACCEPT"); err != nil {
 		return err
 	}
-	if err := runIPTablesCmd("iptables", "-t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port); err != nil {
+	if err := runIPTablesCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", port); err != nil {
 		return err
 	}
 	// IPv6
-	if err := runIPTablesCmd("ip6tables", "-D INPUT -p udp --dport "+port+" -j ACCEPT"); err != nil {
+	if err := runIPTablesCmd("ip6tables", "-D", "INPUT", "-p", "udp", "--dport", port, "-j", "ACCEPT"); err != nil {
 		return err
 	}
-	return runIPTablesCmd("ip6tables", "-t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "+port)
+	return runIPTablesCmd("ip6tables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", port)
 }
 
 func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	defer dnsConn.Close()
-
-	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
 	// We have a variable amount of room in which to encode downstream
 	// packets in each response, because each response must contain the
@@ -815,7 +814,6 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 		}
 		return fmt.Errorf("maximum UDP payload size of %d leaves only %d bytes for payload", maxUDPPayload, mtu)
 	}
-	log.Printf("effective MTU %d", mtu)
 
 	// Start up the virtual PacketConn for turbotunnel.
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
