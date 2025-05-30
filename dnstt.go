@@ -59,7 +59,7 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 	dnstt := &dnstt{}
 	for _, option := range options {
 		if err := option(dnstt); err != nil {
-			slog.Error("applying option", "option", option, "error", err)
+			slog.Error("applying option", "error", err)
 			return nil, fmt.Errorf("applying option: %w", err)
 		}
 	}
@@ -152,11 +152,11 @@ type Option func(*dnstt) error
 func WithDoH(resolverURL string) Option {
 	return func(d *dnstt) error {
 		if d.transport != nil {
-			return fmt.Errorf("transport already set to %s", d.transport)
+			return fmt.Errorf("[WithDoH] transport already set to %s", d.transport)
 		}
 		_, err := url.Parse(resolverURL)
 		if err != nil {
-			return fmt.Errorf("invalid DoH URL: %w", err)
+			return fmt.Errorf("[WithDoH] invalid URL: %w", err)
 		}
 		slog.Info("using DoH", "url", resolverURL)
 		d.transport = &dohDialer{url: resolverURL}
@@ -172,11 +172,11 @@ func WithDoH(resolverURL string) Option {
 func WithDoT(resolverAddr string) Option {
 	return func(d *dnstt) error {
 		if d.transport != nil {
-			return fmt.Errorf("transport already set to %s", d.transport)
+			return fmt.Errorf("[WithDoT] transport already set to %s", d.transport)
 		}
 		_, _, err := net.SplitHostPort(resolverAddr)
 		if err != nil {
-			return fmt.Errorf("invalid DoT address: %w", err)
+			return fmt.Errorf("[WithDoT] invalid address: %w", err)
 		}
 		slog.Info("using DoT", "addr", resolverAddr)
 		d.transport = &dotDialer{addr: resolverAddr}
@@ -192,13 +192,13 @@ func WithTunnelDomain(domain string) Option {
 	return func(d *dnstt) error {
 		domain, err := dns.ParseName(domain)
 		if err != nil {
-			return fmt.Errorf("invalid domain: %w", err)
+			return fmt.Errorf("[WithTunnelDomain] invalid domain: %w", err)
 		}
 
 		d.domain = domain
 		mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
 		if mtu < 80 {
-			return fmt.Errorf("domain %s leaves only %d bytes for payload", domain, mtu)
+			return fmt.Errorf("[WithTunnelDomain] domain %s leaves only %d bytes for payload", domain, mtu)
 		}
 
 		slog.Debug("effective MTU", "mtu", strconv.Itoa(mtu))
@@ -213,7 +213,7 @@ func WithPublicKey(key string) Option {
 	return func(d *dnstt) error {
 		pubkey, err := noise.DecodeKey(key)
 		if err != nil {
-			return fmt.Errorf("invalid public key: %w", err)
+			return fmt.Errorf("[WithPublicKey] invalid public key: %w", err)
 		}
 		d.publicKey = pubkey
 		return nil
@@ -225,11 +225,11 @@ func WithPublicKey(key string) Option {
 func WithUTLSDistribution(distribution string) Option {
 	return func(d *dnstt) error {
 		if d.clientHelloID != nil {
-			return fmt.Errorf("ClientHelloID already set to %v", d.clientHelloID)
+			return fmt.Errorf("[WithUTLSDistribution] ClientHelloID already set to %v", d.clientHelloID)
 		}
 		utlsClientHelloID, err := sampleUTLSDistribution(distribution)
 		if err != nil {
-			return fmt.Errorf("invalid utls distribution: %w", err)
+			return fmt.Errorf("[WithUTLSDistribution] invalid utls distribution: %w", err)
 		}
 		d.clientHelloID = utlsClientHelloID
 		return nil
@@ -241,7 +241,7 @@ func WithUTLSDistribution(distribution string) Option {
 func WithUTLSClientHelloID(hello *utls.ClientHelloID) Option {
 	return func(d *dnstt) error {
 		if d.clientHelloID != nil {
-			return fmt.Errorf("ClientHelloID already set to %v", d.clientHelloID)
+			return fmt.Errorf("[WithUTLSClientHelloID] ClientHelloID already set to %v", d.clientHelloID)
 		}
 		d.clientHelloID = hello
 		return nil
