@@ -79,12 +79,12 @@ func TestRoundTripperE2E(t *testing.T) {
 	rt, err := dt.NewRoundTripper(context.Background(), "")
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", "https://ipconfig.io", nil)
+	req, err := http.NewRequest("GET", "https://detectportal.firefox.com/success.txt", nil)
 	require.NoError(t, err)
 
 	resp, err := rt.RoundTrip(req)
 	require.NoError(t, err)
-	require.Equal(t, resp.StatusCode, http.StatusOK)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	buf, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
