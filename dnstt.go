@@ -5,18 +5,24 @@ package dnstt
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/getlantern/keepcurrent"
+	"github.com/goccy/go-yaml"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -47,6 +53,10 @@ type dnstt struct {
 	transport     transport
 	mtu           int
 
+	httpClient   *http.Client
+	configURL    string
+	pollInterval time.Duration
+
 	sess       *smux.Session
 	sessAccess sync.Mutex
 	closed     atomic.Bool
@@ -56,7 +66,7 @@ type dnstt struct {
 // ClientHelloID, one is generated using a default distribution. An error is returned if encountered
 // while applying options or if an option to set the transport is not provided.
 func NewDNSTT(options ...Option) (DNSTT, error) {
-	dnstt := &dnstt{}
+	dnstt := &dnstt{pollInterval: 12 * time.Hour}
 	for _, option := range options {
 		if err := option(dnstt); err != nil {
 			slog.Error("applying option", "error", err)
@@ -76,7 +86,34 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 	if dnstt.transport == nil {
 		return nil, errors.New("a transport option (e.g., WithDoH or WithDoT) must be provided")
 	}
+	dnstt.keepCurrent()
+
 	return dnstt, nil
+}
+
+// WithHTTPClient sets the HTTP client to use for fetching the dnstt configuration. For example, the client
+// could be censorship-resistant in some way.
+func WithHTTPClient(httpClient *http.Client) Option {
+	return func(d *dnstt) error {
+		d.httpClient = httpClient
+		return nil
+	}
+}
+
+// WithConfigURL sets the URL from which to continually fetch updated dnstt configurations.
+func WithConfigURL(configURL string) Option {
+	return func(d *dnstt) error {
+		d.configURL = configURL
+		return nil
+	}
+}
+
+// WithPollInterval sets the interval at which to poll for updated dnstt configurations.
+func WithPollInterval(interval time.Duration) Option {
+	return func(d *dnstt) error {
+		d.pollInterval = interval
+		return nil
+	}
 }
 
 // Close releases resources and closes active sessions for the dnstt instance.
@@ -151,9 +188,6 @@ type Option func(*dnstt) error
 // https://github.com/curl/curl/wiki/DNS-over-HTTPS#publicly-available-servers
 func WithDoH(resolverURL string) Option {
 	return func(d *dnstt) error {
-		if d.transport != nil {
-			return fmt.Errorf("[WithDoH] transport already set to %s", d.transport)
-		}
 		_, err := url.Parse(resolverURL)
 		if err != nil {
 			return fmt.Errorf("[WithDoH] invalid URL: %w", err)
@@ -171,9 +205,6 @@ func WithDoH(resolverURL string) Option {
 // https://dnsprivacy.org/public_resolvers/#dns-over-tls-dot
 func WithDoT(resolverAddr string) Option {
 	return func(d *dnstt) error {
-		if d.transport != nil {
-			return fmt.Errorf("[WithDoT] transport already set to %s", d.transport)
-		}
 		_, _, err := net.SplitHostPort(resolverAddr)
 		if err != nil {
 			return fmt.Errorf("[WithDoT] invalid address: %w", err)
@@ -352,4 +383,117 @@ func sampleUTLSDistribution(spec string) (*utls.ClientHelloID, error) {
 		ids = append(ids, id)
 	}
 	return ids[sampleWeighted(weights)], nil
+}
+
+func (d *dnstt) onNewConfig(gzippedYML []byte) error {
+	cfg, err := processYaml(gzippedYML)
+	if err != nil {
+		return fmt.Errorf("failed to process dnstt config: %w", err)
+	}
+
+	opts := make([]Option, 0)
+	if cfg.Domain != "" {
+		opts = append(opts, WithTunnelDomain(cfg.Domain))
+	}
+	if cfg.PublicKey != "" {
+		opts = append(opts, WithPublicKey(cfg.PublicKey))
+	}
+	if cfg.DoHResolver != nil {
+		opts = append(opts, WithDoH(*cfg.DoHResolver))
+	}
+	if cfg.DoTResolver != nil {
+		opts = append(opts, WithDoT(*cfg.DoTResolver))
+	}
+	if cfg.UTLSDistribution != nil {
+		opts = append(opts, WithUTLSDistribution(*cfg.UTLSDistribution))
+	}
+
+	for _, option := range opts {
+		if err := option(d); err != nil {
+			return fmt.Errorf("applying option: %w", err)
+		}
+	}
+	return nil
+}
+
+type config struct {
+	Domain           string  `yaml:"domain"`    // DNS tunnel domain, e.g., "t.iantem.io"
+	PublicKey        string  `yaml:"publicKey"` // DNSTT server public key
+	DoHResolver      *string `yaml:"dohResolver,omitempty"`
+	DoTResolver      *string `yaml:"dotResolver,omitempty"`
+	UTLSDistribution *string `yaml:"utlsDistribution,omitempty"`
+}
+
+func processYaml(gzippedYaml []byte) (config, error) {
+	r, gzipErr := gzip.NewReader(bytes.NewReader(gzippedYaml))
+	if gzipErr != nil {
+		return config{}, fmt.Errorf("failed to create gzip reader: %w", gzipErr)
+	}
+	yml, err := io.ReadAll(r)
+	if err != nil {
+		return config{}, fmt.Errorf("failed to read gzipped file: %w", err)
+	}
+	path, err := yaml.PathString("$.dsntt")
+	if err != nil {
+		return config{}, fmt.Errorf("failed to create config path: %w", err)
+	}
+	var cfg config
+	if err = path.Read(bytes.NewReader(yml), &cfg); err != nil {
+		return config{}, fmt.Errorf("failed to read config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// keepCurrent fetches the dnstt configuration from the given URL and keeps it up
+// to date by fetching it periodically.
+func (d *dnstt) keepCurrent() {
+	if d.configURL == "" {
+		slog.Debug("No config URL provided -- not updating fronting configuration")
+		return
+	}
+
+	slog.Debug("Updating dnstt configuration", slog.String("url", d.configURL))
+	source := keepcurrent.FromWebWithClient(d.configURL, d.httpClient)
+	chDB := make(chan []byte)
+	dest := keepcurrent.ToChannel(chDB)
+
+	runner := keepcurrent.NewWithValidator(
+		d.validator(),
+		source,
+		dest,
+	)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("panicked while waiting for dnstt config",
+					slog.Any("recover", r),
+					slog.String("stack", string(debug.Stack())))
+			}
+		}()
+		for data := range chDB {
+			slog.Debug("received new dnstt configuration")
+			if err := d.onNewConfig(data); err != nil {
+				slog.Error("failed to apply new dnstt configuration", "error", err)
+			} else {
+				slog.Info("applied new dnstt configuration",
+					"domain", d.domain,
+					"transport", d.transport,
+				)
+			}
+		}
+	}()
+
+	runner.Start(d.pollInterval)
+}
+
+func (d *dnstt) validator() func([]byte) error {
+	return func(data []byte) error {
+		if _, err := processYaml(data); err != nil {
+			slog.Error("failed to validate dnstt configuration", "error", err)
+			return err
+		}
+		return nil
+	}
 }
