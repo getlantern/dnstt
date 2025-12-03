@@ -64,6 +64,12 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 		}
 	}
 
+	if len(dnstt.domain) == 0 {
+		return nil, errors.New("tunnel domain must be set using WithTunnelDomain")
+	}
+	if dnstt.transport == nil {
+		return nil, errors.New("a transport option (e.g., WithDoH or WithDoT) must be provided")
+	}
 	if dnstt.clientHelloID == nil {
 		slog.Info(
 			"ClientHelloID not set, using default utls distribution to generate one",
@@ -72,9 +78,6 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 		if err := WithUTLSDistribution(defaultUTLSDistribution)(dnstt); err != nil {
 			return nil, fmt.Errorf("applying default utls distribution: %w", err)
 		}
-	}
-	if dnstt.transport == nil {
-		return nil, errors.New("a transport option (e.g., WithDoH or WithDoT) must be provided")
 	}
 	return dnstt, nil
 }
