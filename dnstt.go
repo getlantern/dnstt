@@ -64,7 +64,7 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 		}
 	}
 
-	if dnstt.domain == nil {
+	if len(dnstt.domain) == 0 {
 		return nil, errors.New("tunnel domain must be set using WithTunnelDomain")
 	}
 	if dnstt.transport == nil {
