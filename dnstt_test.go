@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -56,14 +54,7 @@ func TestDNSTT_NewRoundTripper(t *testing.T) {
 }
 
 func TestRoundTripperE2E(t *testing.T) {
-	slog.SetDefault(slog.New(slog.NewTextHandler(
-		os.Stdout,
-		&slog.HandlerOptions{
-			AddSource: true,
-		},
-	)))
-
-	resolver := "https://cloudflare-dns.com/dns-query"
+	resolver := "https://dns.google/dns-query"
 	domain := "t.iantem.io"
 
 	key, err := os.ReadFile("server.pub")
@@ -76,19 +67,20 @@ func TestRoundTripperE2E(t *testing.T) {
 		WithPublicKey(string(key)),
 	)
 	require.NoError(t, err)
+	defer dt.Close()
 	rt, err := dt.NewRoundTripper(context.Background(), "")
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("GET", "https://detectportal.firefox.com/success.txt", nil)
+	url := "https://mock.httpstatus.io/chain?count=2"
+	// url := "https://detectportal.firefox.com/success.txt"
+	req, err := http.NewRequest("GET", url, nil)
 	require.NoError(t, err)
 
-	resp, err := rt.RoundTrip(req)
+	client := &http.Client{
+		Transport: rt,
+	}
+
+	resp, err := client.Do(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	buf, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	t.Logf("Response: %s", buf)
 }
