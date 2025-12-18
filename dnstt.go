@@ -4,10 +4,11 @@
 package dnstt
 
 import (
-	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
@@ -50,6 +52,9 @@ type dnstt struct {
 	sess       *smux.Session
 	sessAccess sync.Mutex
 	closed     atomic.Bool
+
+	pconn net.PacketConn
+	convID  uint32
 }
 
 // NewDNSTT creates a new DNSTT instance with the provided options. If no options are provided for
@@ -79,6 +84,15 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 			return nil, fmt.Errorf("applying default utls distribution: %w", err)
 		}
 	}
+
+	slog.Info("creating new session", "transport", dnstt.transport)
+	pconn, err := dnstt.transport.dial(dnstt.clientHelloID)
+	if err != nil {
+		slog.Error("dial", "error", err, "transport", dnstt.transport)
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	pconn = NewDNSPacketConn(pconn, turbotunnel.DummyAddr{}, dnstt.domain)
+	dnstt.pconn = pconn
 	return dnstt, nil
 }
 
@@ -99,20 +113,80 @@ func (d *dnstt) isClosed() bool {
 	return d.closed.Load()
 }
 
-// NewRoundTripper creates a new HTTP round tripper for the given address.
-// It manages session creation and reuse.
-func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTripper, error) {
-	if d.isClosed() {
-		return nil, errors.New("dnstt is closed")
-	}
-
+func (d *dnstt) maybeCreateSession() (err error) {
 	d.sessAccess.Lock()
 	defer d.sessAccess.Unlock()
-	var err error
-	if d.sess != nil {
-		conn, err := d.sess.OpenStream()
+	if d.sess != nil && !d.sess.IsClosed() {
+		return nil
+	}
+
+	// Open a KCP conn on the PacketConn.
+	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, d.pconn)
+	if err != nil {
+		return fmt.Errorf("opening KCP conn: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			d.convID = 0
+			conn.Close()
+		}
+	}()
+
+	d.convID = conn.GetConv()
+	// Permit coalescing the payloads of consecutive sends.
+	conn.SetStreamMode(true)
+	// Disable the dynamic congestion window (limit only by the maximum of
+	// local and remote static windows).
+	conn.SetNoDelay(
+		0, // default nodelay
+		0, // default interval
+		0, // default resend
+		1, // nc=1 => congestion window off
+	)
+	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	if !conn.SetMtu(d.mtu) {
+		return fmt.Errorf("setting MTU to %d", d.mtu)
+	}
+
+	// Put a Noise channel on top of the KCP conn.
+	var rw io.ReadWriteCloser = conn
+	if d.publicKey != nil {
+		// Put a Noise channel on top of the KCP conn.
+		rw, err = noise.NewClient(conn, d.publicKey)
+		if err != nil {
+			return fmt.Errorf("opening Noise channel: %w", err)
+		}
+	}
+
+	// Start a smux session
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = 2
+	smuxConfig.KeepAliveTimeout = idleTimeout
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	d.sess, err = smux.Client(rw, smuxConfig)
+	if err != nil {
+		return fmt.Errorf("creating session: %w", err)
+	}
+
+	// check if dnstt is closed again before assigning the new session
+	if d.isClosed() {
+		d.sess.Close()
+		return errors.New("dnstt is closed")
+	}
+
+	slog.Debug("begin session", "sessionID", fmt.Sprintf("%08x", d.convID))
+	return nil
+}
+
+func (d *dnstt) getStream() (*smux.Stream, error) {
+	err := d.maybeCreateSession()
+	if err != nil {
+		return nil, fmt.Errorf("creating session: %w", err)
+	}
+	if !d.sess.IsClosed() {
+		stream, err := d.sess.OpenStream()
 		if err == nil {
-			return &connectedRoundTripper{conn: conn}, nil
+			return stream, nil
 		}
 		if !errors.Is(err, smux.ErrGoAway) {
 			return nil, fmt.Errorf("opening stream: %w", err)
@@ -121,27 +195,38 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 		slog.Debug("session stream id overflowed, closing current session")
 		d.sess.Close()
 	}
+	err = d.maybeCreateSession()
+	if err != nil {
+		return nil, fmt.Errorf("creating new session: %w", err)
+	}
 
-	slog.Info("creating new session", "transport", d.transport)
-	pconn, err := d.transport.dial(d.clientHelloID)
+	stream, err := d.sess.OpenStream()
 	if err != nil {
-		slog.Error("dial", "error", err, "transport", d.transport)
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-	pconn = NewDNSPacketConn(pconn, turbotunnel.DummyAddr{}, d.domain)
-	sess, err := newSession(pconn, d.mtu, d.publicKey)
-	if err != nil {
-		pconn.Close()
-		return nil, fmt.Errorf("creating session: %w", err)
-	}
-	conn, err := sess.OpenStream()
-	if err != nil {
-		sess.Close()
 		return nil, fmt.Errorf("opening stream: %w", err)
 	}
+	return stream, nil
+}
 
-	d.sess = sess
-	return &connectedRoundTripper{conn: conn}, nil
+// NewRoundTripper creates a new HTTP round tripper for the given address.
+// It manages session creation and reuse.
+func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTripper, error) {
+	if d.isClosed() {
+		return nil, errors.New("dnstt is closed")
+	}
+	rt := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			stream, err := d.getStream()
+			if err != nil {
+				return nil, fmt.Errorf("creating stream: %w", err)
+			}
+			slog.Debug(fmt.Sprintf("begin stream %08x:%d", d.convID, stream.ID()))
+			return &conn{Stream: stream, sessID: d.convID}, nil
+		},
+		Proxy: func(*http.Request) (*url.URL, error) {
+			return url.Parse("http://127.0.0.1:8080") // dummy to force request to be sent correctly
+		},
+	}
+	return rt, nil
 }
 
 // Option is a function type used to configure the dnstt instance.
@@ -235,6 +320,10 @@ func WithUTLSDistribution(distribution string) Option {
 			return fmt.Errorf("[WithUTLSDistribution] invalid utls distribution: %w", err)
 		}
 		d.clientHelloID = utlsClientHelloID
+		slog.Debug("uTLS fingerprint",
+			"client", utlsClientHelloID.Client,
+			"version", utlsClientHelloID.Version,
+		)
 		return nil
 	}
 }
@@ -265,7 +354,19 @@ type dohDialer struct {
 }
 
 func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
-	rt := NewUTLSRoundTripper(nil, hello)
+	var rt http.RoundTripper
+	if hello == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		// Disable DefaultTransport's default Proxy =
+		// ProxyFromEnvironment setting, for conformity
+		// with utlsRoundTripper and with DoT mode,
+		// which do not take a proxy from the
+		// environment.
+		transport.Proxy = nil
+		rt = transport
+	} else {
+		rt = NewUTLSRoundTripper(nil, hello)
+	}
 	return NewHTTPPacketConn(rt, d.url, 32)
 }
 
@@ -277,32 +378,53 @@ type dotDialer struct {
 }
 
 func (d *dotDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
-	dialTLSContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return utlsDialContext(ctx, network, addr, nil, hello)
+	var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	if hello == nil {
+		dialTLSContext = (&tls.Dialer{}).DialContext
+	} else {
+		dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return utlsDialContext(ctx, network, addr, nil, hello)
+		}
 	}
 	return NewTLSPacketConn(d.addr, dialTLSContext)
 }
 
 func (d *dotDialer) String() string { return "DoT[" + d.addr + "]" }
 
-// connectedRoundTripper implements the http.RoundTripper interface for handling HTTP requests over
-// a DNS-based connection.
-type connectedRoundTripper struct {
-	conn net.Conn
+type conn struct {
+	*smux.Stream
+	sessID uint32
 }
 
-func (rt *connectedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	err := req.Write(rt.conn)
-	if err != nil {
-		return nil, fmt.Errorf("writing request: %w", err)
+func (c *conn) Write(b []byte) (int, error) {
+	n, err := c.Stream.Write(b)
+	if err == io.EOF {
+		// smux Stream.Write may return io.EOF.
+		err = nil
 	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(rt.conn), req)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		id := fmt.Sprintf("%08x:%d", c.sessID, c.Stream.ID())
+		slog.Error("stream write error", "stream", id, "error", err)
 	}
+	return n, err
+}
 
-	return resp, nil
+func (c *conn) Read(b []byte) (int, error) {
+	n, err := c.Stream.Read(b)
+	if err == io.EOF {
+		// smux Stream.Write may return io.EOF.
+		err = nil
+	}
+	if err != nil {
+		id := fmt.Sprintf("%08x:%d", c.sessID, c.Stream.ID())
+		slog.Error("stream read error", "stream", id, "error", err)
+	}
+	return n, err
+}
+
+func (c *conn) Close() error {
+	slog.Debug("closing conn", "streamID", c.Stream.ID())
+	return c.Stream.Close()
 }
 
 ///////////////////////////////////////////////////////////////////////
