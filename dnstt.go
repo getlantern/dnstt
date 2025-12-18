@@ -53,8 +53,7 @@ type dnstt struct {
 	sessAccess sync.Mutex
 	closed     atomic.Bool
 
-	streams sync.Pool
-	pconn   net.PacketConn
+	pconn net.PacketConn
 	convID  uint32
 }
 
