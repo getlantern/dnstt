@@ -322,7 +322,10 @@ func WithUTLSDistribution(distribution string) Option {
 			return fmt.Errorf("[WithUTLSDistribution] invalid utls distribution: %w", err)
 		}
 		d.clientHelloID = utlsClientHelloID
-		slog.Debug("uTLS fingerprint", utlsClientHelloID.Client, utlsClientHelloID.Version)
+		slog.Debug("uTLS fingerprint",
+			"client", utlsClientHelloID.Client,
+			"version", utlsClientHelloID.Version,
+		)
 		return nil
 	}
 }
