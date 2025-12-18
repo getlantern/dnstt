@@ -166,7 +166,6 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	d.sess, err = smux.Client(rw, smuxConfig)
 	if err != nil {
-		// pconn.Close()
 		return fmt.Errorf("creating session: %w", err)
 	}
 
