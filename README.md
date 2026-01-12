@@ -1,6 +1,7 @@
 # dnstt
 
-Userspace DNS tunnel RoundTripper based on [dnstt](https://www.bamsoftware.com/software/dnstt/) by David Fifield.
+Userspace DNS tunnel RoundTripper based on [dnstt](https://www.bamsoftware.com/software/dnstt/) by David Fifield. 
+As with David's DNSTT, this repository is all contributed to the public domain.
 
 ## DNS zone setup
 
