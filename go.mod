@@ -9,7 +9,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/xtaci/kcp-go/v5 v5.6.20
 	github.com/xtaci/smux v1.5.34
-	golang.org/x/net v0.39.0
+	golang.org/x/net v0.47.0
 	www.bamsoftware.com/git/dnstt.git v1.20241021.0
 )
 
@@ -27,8 +27,8 @@ require (
 	github.com/templexxx/cpu v0.1.1 // indirect
 	github.com/templexxx/xorsimd v0.4.3 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
-	golang.org/x/crypto v0.37.0 // indirect
-	golang.org/x/sys v0.32.0 // indirect
-	golang.org/x/text v0.24.0 // indirect
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
