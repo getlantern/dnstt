@@ -46,6 +46,7 @@ type dnstt struct {
 	domain        dns.Name
 	publicKey     []byte
 	clientHelloID *utls.ClientHelloID
+	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
 	transport     transport
 	mtu           int
 
@@ -83,6 +84,18 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 		if err := WithUTLSDistribution(defaultUTLSDistribution)(dnstt); err != nil {
 			return nil, fmt.Errorf("applying default utls distribution: %w", err)
 		}
+	}
+
+	// Inject the dialer into the transport implementations.
+	dial := dnstt.dialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	switch t := dnstt.transport.(type) {
+	case *dohDialer:
+		t.dialContext = dial
+	case *dotDialer:
+		t.dialContext = dial
 	}
 
 	slog.Info("creating new session", "transport", dnstt.transport)
@@ -340,6 +353,15 @@ func WithUTLSClientHelloID(hello *utls.ClientHelloID) Option {
 	}
 }
 
+// WithDialer sets a custom dialer function for the dnstt instance. This allows callers to
+// inject their own dialer for making TCP connections used by the DNS transport.
+func WithDialer(dial func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
+	return func(d *dnstt) error {
+		d.dialContext = dial
+		return nil
+	}
+}
+
 // transport defines an interface for dialing a DNS-based connection.
 type transport interface {
 	// dial establishes a DNS-based connection using the provided ClientHelloID.
@@ -350,7 +372,8 @@ type transport interface {
 
 // dohDialer implements the transport interface for DNS-over-HTTPS.
 type dohDialer struct {
-	url string
+	url         string
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
@@ -365,7 +388,7 @@ func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
 		transport.Proxy = nil
 		rt = transport
 	} else {
-		rt = NewUTLSRoundTripper(nil, hello)
+		rt = NewUTLSRoundTripperWithDialer(d.dialContext, nil, hello)
 	}
 	return NewHTTPPacketConn(rt, d.url, 32)
 }
@@ -374,7 +397,8 @@ func (d *dohDialer) String() string { return "DoH[" + d.url + "]" }
 
 // dotDialer implements the transport interface for DNS-over-TLS.
 type dotDialer struct {
-	addr string
+	addr        string
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 func (d *dotDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
@@ -383,7 +407,7 @@ func (d *dotDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
 		dialTLSContext = (&tls.Dialer{}).DialContext
 	} else {
 		dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return utlsDialContext(ctx, network, addr, nil, hello)
+			return utlsDialContextWithDialer(ctx, d.dialContext, network, addr, nil, hello)
 		}
 	}
 	return NewTLSPacketConn(d.addr, dialTLSContext)
