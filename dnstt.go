@@ -96,6 +96,8 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 		t.dialContext = dial
 	case *dotDialer:
 		t.dialContext = dial
+	default:
+		slog.Warn("unable to inject custom dialer into transport; unrecognized transport type", "transportType", fmt.Sprintf("%T", t))
 	}
 
 	slog.Info("creating new session", "transport", dnstt.transport)

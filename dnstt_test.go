@@ -41,6 +41,59 @@ func TestNewDNSTT(t *testing.T) {
 	assert.NotNil(t, dtt.(*dnstt).clientHelloID)
 }
 
+func TestWithDialer_DoH(t *testing.T) {
+	customDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("custom dialer called")
+	}
+	dt, err := NewDNSTT(
+		WithTunnelDomain("t.example.com"),
+		WithDoH("https://example.com"),
+		WithDialer(customDialer),
+	)
+	require.NoError(t, err)
+	defer dt.Close()
+
+	d := dt.(*dnstt)
+	doh, ok := d.transport.(*dohDialer)
+	require.True(t, ok)
+	assert.NotNil(t, doh.dialContext, "dialContext should be set on dohDialer")
+
+	// Verify the custom dialer is actually the one injected by calling it.
+	_, err = doh.dialContext(context.Background(), "tcp", "example.com:443")
+	assert.Error(t, err)
+	assert.Equal(t, "custom dialer called", err.Error())
+}
+
+func TestWithDialer_DoT(t *testing.T) {
+	customDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("custom dialer called")
+	}
+	// For DoT, the dialer is called during NewDNSTT (transport.dial connects immediately),
+	// so we expect NewDNSTT to fail with our custom dialer's error.
+	_, err := NewDNSTT(
+		WithTunnelDomain("t.example.com"),
+		WithDoT("1.1.1.1:853"),
+		WithDialer(customDialer),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "custom dialer called")
+}
+
+func TestWithDialer_DefaultFallback(t *testing.T) {
+	// When no WithDialer is provided, a default dialer should still be injected.
+	dt, err := NewDNSTT(
+		WithTunnelDomain("t.example.com"),
+		WithDoH("https://example.com"),
+	)
+	require.NoError(t, err)
+	defer dt.Close()
+
+	d := dt.(*dnstt)
+	doh, ok := d.transport.(*dohDialer)
+	require.True(t, ok)
+	assert.NotNil(t, doh.dialContext, "dialContext should be set to default dialer")
+}
+
 func TestDNSTT_NewRoundTripper(t *testing.T) {
 	mockTransport := &mockTransport{}
 	mockTransport.On("dial", mock.Anything).Return(nil, errors.New("dial error"))
