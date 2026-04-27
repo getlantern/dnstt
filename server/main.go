@@ -901,8 +901,15 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 }
 
 func startPprof() {
+	pprofDebug := strings.TrimSpace(os.Getenv("PPROF_DEBUG"))
+	if pprofDebug == "" || pprofDebug == "0" || strings.EqualFold(pprofDebug, "false") {
+		return
+	}
+
 	go func() {
-		_ = http.ListenAndServe("127.0.0.1:6060", nil)
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			log.Printf("pprof server stopped: %v", err)
+		}
 	}()
 }
 

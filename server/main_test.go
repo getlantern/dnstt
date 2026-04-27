@@ -68,13 +68,16 @@ func TestPipeDataExitsOnHungTarget(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
+	stop := make(chan struct{})
+	defer close(stop)
+
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-		time.Sleep(10 * time.Second) // hangs indefinitely
+		<-stop
 	}()
 
 	targetConn, err := net.Dial("tcp", ln.Addr().String())
