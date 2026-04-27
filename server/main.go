@@ -47,6 +47,13 @@ const (
 
 	// How long to wait for a TCP connection to upstream to be established.
 	upstreamDialTimeout = 30 * time.Second
+
+	// How frequently to send TCP keepalive probes to upstream targets. The OS
+	// closes the connection after a system-dependent number of missed probes
+	// (typically ~9 on Linux with the default 75 s probe interval, so ~11 min
+	// total). A short period here means a hung upstream is detected and the
+	// pipeData goroutines unblocked much sooner.
+	upstreamKeepalivePeriod = 30 * time.Second
 )
 
 var (
@@ -192,6 +199,13 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 		return fmt.Errorf("stream %08x:%d connect target %s: %v", conv, stream.ID(), targetAddr, err)
 	}
 	defer targetConn.Close()
+	// Enable TCP keepalives so the OS can detect and close connections to
+	// upstream targets that stop responding without sending FIN/RST. Without
+	// this, a hung server holds the pipeData goroutines open indefinitely.
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(upstreamKeepalivePeriod)
+	}
 
 	if req.Method == "CONNECT" {
 		// HTTP tunnel
