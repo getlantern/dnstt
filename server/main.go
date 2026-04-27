@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"strings"
@@ -846,6 +847,12 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	return recvLoop(domain, dnsConn, ttConn, ch)
 }
 
+func startPprof() {
+	go func() {
+		_ = http.ListenAndServe("127.0.0.1:6060", nil)
+	}()
+}
+
 func main() {
 	var genKey bool
 	var privkeyFilename string
@@ -952,6 +959,7 @@ Example:
 			}
 		}
 
+		startPprof()
 		err = run(privkey, domain, dnsConn)
 		if err != nil {
 			log.Fatal(err)
