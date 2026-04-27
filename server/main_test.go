@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net"
 	"runtime"
 	"testing"
@@ -123,6 +124,38 @@ func TestPipeDataNoGoroutineLeak(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond,
 		"goroutines did not drain after connections closed (current: %d, baseline: %d)",
 		runtime.NumGoroutine(), baseline)
+}
+
+// TestWriteTimeoutConnTimesOut verifies that writeTimeoutConn returns a timeout
+// error when the remote peer stops consuming data — simulating a client that
+// has disappeared and left the KCP send-window full.
+func TestWriteTimeoutConnTimesOut(t *testing.T) {
+	// net.Pipe is synchronous: writes to 'a' block until 'b' reads.
+	// By not reading from 'b' we recreate the full-send-window condition.
+	a, b := net.Pipe()
+	defer b.Close()
+
+	wrapped := &writeTimeoutConn{a, 100 * time.Millisecond}
+
+	_, err := wrapped.Write([]byte("data that will never be consumed"))
+	require.Error(t, err, "expected write to time out when reader is not consuming")
+	var netErr net.Error
+	require.ErrorAs(t, err, &netErr)
+	assert.True(t, netErr.Timeout(), "expected a timeout error, got: %v", err)
+}
+
+// TestWriteTimeoutConnSucceedsNormally verifies that writeTimeoutConn does not
+// interfere with writes when the remote peer is actively reading.
+func TestWriteTimeoutConnSucceedsNormally(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	go io.Copy(io.Discard, b) // consume everything written to a
+
+	wrapped := &writeTimeoutConn{a, 100 * time.Millisecond}
+	_, err := wrapped.Write([]byte("hello"))
+	assert.NoError(t, err)
 }
 
 // TestUpstreamConnKeepaliveEnabled verifies that the TCP keepalive option is
