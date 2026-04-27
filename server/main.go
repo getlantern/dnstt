@@ -210,9 +210,15 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 	// Enable TCP keepalives so the OS can detect and close connections to
 	// upstream targets that stop responding without sending FIN/RST. Without
 	// this, a hung server holds the pipeData goroutines open indefinitely.
+	// Keepalives are best-effort: log failures but do not abort the stream,
+	// since the proxy still works correctly; it just loses the early-detection
+	// safety net on platforms where these syscalls are unsupported.
 	if tc, ok := targetConn.(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(upstreamKeepalivePeriod)
+		if err := tc.SetKeepAlive(true); err != nil {
+			log.Printf("stream %08x:%d: SetKeepAlive: %v", conv, stream.ID(), err)
+		} else if err := tc.SetKeepAlivePeriod(upstreamKeepalivePeriod); err != nil {
+			log.Printf("stream %08x:%d: SetKeepAlivePeriod: %v", conv, stream.ID(), err)
+		}
 	}
 
 	if req.Method == "CONNECT" {
@@ -263,13 +269,12 @@ func (c *writeTimeoutConn) Write(b []byte) (int, error) {
 	if err := c.Conn.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
 		return 0, err
 	}
-	n, err := c.Conn.Write(b)
-	if err == nil {
-		// Reset the deadline so a slow-but-alive session isn't penalised
-		// across calls; each write gets a fresh window.
-		c.Conn.SetWriteDeadline(time.Time{})
-	}
-	return n, err
+	// Always clear the deadline on exit — whether Write succeeds, returns a
+	// partial write, or times out — so a stale past-deadline never bleeds
+	// into the next call. Errors from clearing are ignored: if the connection
+	// is already broken, the error from Write is the one that matters.
+	defer c.Conn.SetWriteDeadline(time.Time{})
+	return c.Conn.Write(b)
 }
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,

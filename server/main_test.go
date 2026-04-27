@@ -144,6 +144,29 @@ func TestWriteTimeoutConnTimesOut(t *testing.T) {
 	assert.True(t, netErr.Timeout(), "expected a timeout error, got: %v", err)
 }
 
+// TestWriteTimeoutConnClearsDeadlineAfterError verifies that the write deadline
+// is cleared even when Write returns an error (the case Copilot flagged).
+// Without the defer, a stale past-deadline would cause the next write to fail
+// immediately, even if the connection recovers from a transient error.
+func TestWriteTimeoutConnClearsDeadlineAfterError(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+
+	wrapped := &writeTimeoutConn{a, 100 * time.Millisecond}
+
+	// First write times out because nobody is reading from b.
+	_, err := wrapped.Write([]byte("blocked"))
+	require.Error(t, err)
+
+	// Start consuming from b so the next write can succeed.
+	go io.Copy(io.Discard, b)
+
+	// If the deadline was not cleared after the error, this second write would
+	// fail immediately with a past-deadline error rather than succeeding.
+	_, err = wrapped.Write([]byte("should succeed now"))
+	assert.NoError(t, err, "write should succeed after deadline is cleared on error path")
+}
+
 // TestWriteTimeoutConnSucceedsNormally verifies that writeTimeoutConn does not
 // interfere with writes when the remote peer is actively reading.
 func TestWriteTimeoutConnSucceedsNormally(t *testing.T) {
