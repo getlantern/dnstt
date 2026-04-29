@@ -879,7 +879,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	}
 
 	// Start up the virtual PacketConn for turbotunnel.
-	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
+	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout)
 	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
 	if err != nil {
 		return fmt.Errorf("opening KCP listener: %v", err)
@@ -899,12 +899,14 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	// We could run multiple copies of sendLoop; that would allow more time
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
-	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
-		if err != nil {
-			log.Printf("sendLoop: %v", err)
-		}
-	}()
+	for i := 0; i < 10; i++ {
+		go func() {
+			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
+			if err != nil {
+				log.Printf("sendLoop: %v", err)
+			}
+		}()
+	}
 
 	return recvLoop(domain, dnsConn, ttConn, ch)
 }
