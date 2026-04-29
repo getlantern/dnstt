@@ -12,7 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -215,9 +215,9 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 	// safety net on platforms where these syscalls are unsupported.
 	if tc, ok := targetConn.(*net.TCPConn); ok {
 		if err := tc.SetKeepAlive(true); err != nil {
-			log.Printf("stream %08x:%d: SetKeepAlive: %v", conv, stream.ID(), err)
+			slog.Warn("SetKeepAlive failed", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
 		} else if err := tc.SetKeepAlivePeriod(upstreamKeepalivePeriod); err != nil {
-			log.Printf("stream %08x:%d: SetKeepAlivePeriod: %v", conv, stream.ID(), err)
+			slog.Warn("SetKeepAlivePeriod failed", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
 		}
 	}
 
@@ -308,17 +308,17 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 			return err
 		}
 		if err := stream.SetDeadline(time.Now().Add(kcpWriteTimeout)); err != nil {
-			log.Printf("failed to set stream deadline: %v", err)
+			slog.Warn("failed to set stream deadline", slog.Any("err", err))
 		}
-		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
+		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 		go func() {
 			defer func() {
-				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
+				slog.Info("end stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 				stream.Close()
 			}()
 			err := handleStream(stream, conn.GetConv())
 			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				slog.Error("handleStream failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
 			}
 		}()
 	}
@@ -335,7 +335,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 			}
 			return err
 		}
-		log.Printf("begin session %08x", conn.GetConv())
+		slog.Info("begin session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
 		// Disable the dynamic congestion window (limit only by the
@@ -346,19 +346,20 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 			0, // default resend
 			1, // nc=1 => congestion window off
 		)
-		conn.SetDeadline(time.Now().Add(kcpWriteTimeout))
+		conn.SetReadDeadline(time.Now().Add(kcpReadTimeout))
+		conn.SetWriteDeadline(time.Now().Add(kcpWriteTimeout))
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
 		}
 		go func() {
 			defer func() {
-				log.Printf("end session %08x", conn.GetConv())
+				slog.Info("end session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 				conn.Close()
 			}()
 			err := acceptStreams(conn, privkey)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
+				slog.Error("acceptStreams failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("err", err))
 			}
 		}()
 	}
@@ -435,7 +436,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// "If a query message with more than one OPT RR is
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
-			log.Printf("FORMERR: more than one OPT RR")
+			slog.Warn("FORMERR: more than one OPT RR")
 			return resp, nil
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
@@ -455,7 +456,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
-			log.Printf("BADVERS: EDNS version %d != 0", version)
+			slog.Warn("BADVERS: unsupported EDNS version", slog.Any("version", version))
 			return resp, nil
 		}
 
@@ -472,7 +473,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
+		slog.Warn("FORMERR: unexpected question count", slog.Any("count", len(query.Question)))
 		return resp, nil
 	}
 	question := query.Question[0]
@@ -484,7 +485,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
+		slog.Warn("NXDOMAIN: not authoritative", slog.Any("name", question.Name))
 		return resp, nil
 	}
 	resp.Flags |= 0x0400 // AA = 1
@@ -492,7 +493,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
-		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
+		slog.Warn("NOTIMPL: unrecognized OPCODE", slog.Any("opcode", query.Opcode()))
 		return resp, nil
 	}
 
@@ -513,7 +514,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if err != nil {
 		// Base32 error, make like the name doesn't exist.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: base32 decoding: %v", err)
+		slog.Warn("NXDOMAIN: base32 decoding error", slog.Any("err", err))
 		return resp, nil
 	}
 	payload = payload[:n]
@@ -526,7 +527,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// FORMERR MUST be returned."
 	if payloadSize < maxUDPPayload {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
+		slog.Warn("FORMERR: requester payload too small", slog.Any("payload_size", payloadSize), slog.Any("minimum", maxUDPPayload))
 		return resp, nil
 	}
 
@@ -554,7 +555,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		n, addr, err := dnsConn.ReadFrom(buf[:])
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("ReadFrom temporary error: %v", err)
+				slog.Warn("ReadFrom temporary error", slog.Any("err", err))
 				continue
 			}
 			return err
@@ -563,7 +564,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
-			log.Printf("cannot parse DNS query: %v", err)
+			slog.Warn("cannot parse DNS query", slog.Any("err", err))
 			continue
 		}
 
@@ -588,7 +589,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			// Payload is not long enough to contain a ClientID.
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+				slog.Warn("NXDOMAIN: payload too short for ClientID", slog.Any("bytes", n))
 			}
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
@@ -703,13 +704,13 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 		buf, err := rec.Resp.WireFormat()
 		if err != nil {
-			log.Printf("resp WireFormat: %v", err)
+			slog.Error("resp WireFormat error", slog.Any("err", err))
 			continue
 		}
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
 		if len(buf) > maxUDPPayload {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
+			slog.Debug("truncating response", slog.Any("size", len(buf)), slog.Any("max", maxUDPPayload))
 			buf = buf[:maxUDPPayload]
 			buf[2] |= 0x02 // TC = 1
 		}
@@ -718,7 +719,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		_, err = dnsConn.WriteTo(buf, rec.Addr)
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("WriteTo temporary error: %v", err)
+				slog.Warn("WriteTo temporary error", slog.Any("err", err))
 				continue
 			}
 			return err
@@ -889,7 +890,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	go func() {
 		err := acceptSessions(ln, privkey, mtu)
 		if err != nil {
-			log.Printf("acceptSessions: %v", err)
+			slog.Error("acceptSessions error", slog.Any("err", err))
 		}
 	}()
 
@@ -903,7 +904,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 		go func() {
 			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
 			if err != nil {
-				log.Printf("sendLoop: %v", err)
+				slog.Error("sendLoop error", slog.Any("err", err))
 			}
 		}()
 	}
@@ -914,7 +915,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 func startPprof() {
 	go func() {
 		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
-			log.Printf("pprof server stopped: %v", err)
+			slog.Error("pprof server stopped", slog.Any("err", err))
 		}
 	}()
 }
@@ -946,7 +947,14 @@ Example:
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.LUTC)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				a.Value = slog.TimeValue(a.Value.Time().UTC())
+			}
+			return a
+		},
+	})))
 
 	if genKey {
 		// -gen-key mode.
@@ -1015,8 +1023,8 @@ Example:
 			}
 		}
 		if len(privkey) == 0 {
-			log.Println("generating a temporary one-time keypair")
-			log.Println("use the -privkey or -privkey-file option for a persistent server keypair")
+			slog.Warn("generating a temporary one-time keypair")
+			slog.Warn("use the -privkey or -privkey-file option for a persistent server keypair")
 			var err error
 			privkey, err = noise.GeneratePrivkey()
 			if err != nil {
@@ -1031,7 +1039,8 @@ Example:
 		}
 		err = run(privkey, domain, dnsConn)
 		if err != nil {
-			log.Fatal(err)
+			slog.Error("run failed", slog.Any("err", err))
+			os.Exit(1)
 		}
 	}
 }
