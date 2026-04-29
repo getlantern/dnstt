@@ -307,6 +307,9 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 			}
 			return err
 		}
+		if err := stream.SetDeadline(time.Now().Add(kcpWriteTimeout)); err != nil {
+			log.Printf("failed to set stream deadline: %v", err)
+		}
 		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
 		go func() {
 			defer func() {
@@ -343,6 +346,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 			0, // default resend
 			1, // nc=1 => congestion window off
 		)
+		conn.SetDeadline(time.Now().Add(kcpWriteTimeout))
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
