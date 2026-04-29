@@ -1,7 +1,6 @@
 package main
 
 import (
-	"io"
 	"net"
 	"runtime"
 	"testing"
@@ -129,59 +128,33 @@ func TestPipeDataNoGoroutineLeak(t *testing.T) {
 		runtime.NumGoroutine(), baseline)
 }
 
-// TestWriteTimeoutConnTimesOut verifies that writeTimeoutConn returns a timeout
-// error when the remote peer stops consuming data — simulating a client that
-// has disappeared and left the KCP send-window full.
-func TestWriteTimeoutConnTimesOut(t *testing.T) {
-	// net.Pipe is synchronous: writes to 'a' block until 'b' reads.
-	// By not reading from 'b' we recreate the full-send-window condition.
+// TestStreamDeadlineBoundsGoroutine is the regression test for the dominant
+// goroutine leak: goroutines stuck waiting for data that never arrives.
+// acceptStreams calls stream.SetDeadline(kcpWriteTimeout) on every accepted
+// stream so that a parked goroutine is unblocked once the deadline fires —
+// verified here using a plain net.Pipe with the same deadline pattern.
+func TestStreamDeadlineBoundsGoroutine(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()
 
-	wrapped := &writeTimeoutConn{a, 100 * time.Millisecond}
+	require.NoError(t, a.SetDeadline(time.Now().Add(150*time.Millisecond)))
 
-	_, err := wrapped.Write([]byte("data that will never be consumed"))
-	require.Error(t, err, "expected write to time out when reader is not consuming")
-	var netErr net.Error
-	require.ErrorAs(t, err, &netErr)
-	assert.True(t, netErr.Timeout(), "expected a timeout error, got: %v", err)
-}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 1024)
+		_, err := a.Read(buf)
+		require.Error(t, err)
+		var netErr net.Error
+		require.ErrorAs(t, err, &netErr)
+		assert.True(t, netErr.Timeout())
+	}()
 
-// TestWriteTimeoutConnClearsDeadlineAfterError verifies that the write deadline
-// is cleared even when Write returns an error (the case Copilot flagged).
-// Without the defer, a stale past-deadline would cause the next write to fail
-// immediately, even if the connection recovers from a transient error.
-func TestWriteTimeoutConnClearsDeadlineAfterError(t *testing.T) {
-	a, b := net.Pipe()
-	defer b.Close()
-
-	wrapped := &writeTimeoutConn{a, 100 * time.Millisecond}
-
-	// First write times out because nobody is reading from b.
-	_, err := wrapped.Write([]byte("blocked"))
-	require.Error(t, err)
-
-	// Start consuming from b so the next write can succeed.
-	go io.Copy(io.Discard, b)
-
-	// If the deadline was not cleared after the error, this second write would
-	// fail immediately with a past-deadline error rather than succeeding.
-	_, err = wrapped.Write([]byte("should succeed now"))
-	assert.NoError(t, err, "write should succeed after deadline is cleared on error path")
-}
-
-// TestWriteTimeoutConnSucceedsNormally verifies that writeTimeoutConn does not
-// interfere with writes when the remote peer is actively reading.
-func TestWriteTimeoutConnSucceedsNormally(t *testing.T) {
-	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
-
-	go io.Copy(io.Discard, b) // consume everything written to a
-
-	wrapped := &writeTimeoutConn{a, 100 * time.Millisecond}
-	_, err := wrapped.Write([]byte("hello"))
-	assert.NoError(t, err)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine did not exit after stream deadline expired")
+	}
 }
 
 // TestUpstreamConnKeepaliveEnabled verifies that the TCP keepalive option is

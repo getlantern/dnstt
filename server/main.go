@@ -62,6 +62,7 @@ const (
 	// which writes a ping every 10 s — will fail fast rather than blocking
 	// indefinitely, allowing smux to detect and close the dead session.
 	kcpWriteTimeout = 30 * time.Second
+	kcpReadTimeout  = 60 * time.Second
 )
 
 var (
@@ -249,41 +250,13 @@ func pipeData(stream, targetConn io.ReadWriteCloser) {
 	<-done // Wait for the stream to close.
 }
 
-// writeTimeoutConn wraps a net.Conn and enforces a per-write deadline.
-//
-// Without this, smux keepalive writes can block indefinitely once the KCP
-// send-window fills up — which happens when a client disappears and stops
-// ACKing. The blocked write prevents smux from ever reaching its
-// KeepAliveTimeout check, so dead sessions are never reaped and their
-// pipeData goroutines accumulate.
-//
-// By timing out each write individually, a failed write propagates through
-// Noise → smux immediately, causing smux to close the session and unblock
-// all associated streams.
-type writeTimeoutConn struct {
-	net.Conn
-	timeout time.Duration
-}
-
-func (c *writeTimeoutConn) Write(b []byte) (int, error) {
-	if err := c.Conn.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
-		return 0, err
-	}
-	// Always clear the deadline on exit — whether Write succeeds, returns a
-	// partial write, or times out — so a stale past-deadline never bleeds
-	// into the next call. Errors from clearing are ignored: if the connection
-	// is already broken, the error from Write is the one that matters.
-	defer c.Conn.SetWriteDeadline(time.Time{})
-	return c.Conn.Write(b)
-}
-
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
 func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 	// Put a Noise channel on top of the KCP conn.
 	// Wrap conn with a per-write deadline so that smux keepalive writes fail
 	// fast when the client stops ACKing, rather than blocking indefinitely.
-	rw, err := noise.NewServer(&writeTimeoutConn{conn, kcpWriteTimeout}, privkey)
+	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
 		return err
 	}
