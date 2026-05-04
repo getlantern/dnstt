@@ -245,6 +245,9 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 		}
 	}
 
+	// Clear the stream deadline before piping: the request phase is done, so
+	// pipeData can run for as long as the upstream connection is alive.
+	stream.SetDeadline(time.Time{})
 	pipeData(stream, targetConn)
 	return nil
 }
@@ -261,15 +264,45 @@ func pipeData(stream, targetConn io.ReadWriteCloser) {
 	<-done // Wait for the stream to close.
 }
 
+// rollingDeadlineRW wraps a kcp.UDPSession and resets read/write deadlines on
+// every I/O call. This ensures:
+//   - Reads time out if no data arrives within kcpReadTimeout (detects a stalled
+//     session where the client has silently disappeared and stopped querying).
+//   - Writes time out within kcpWriteTimeout if the client's KCP receive window
+//     is full (i.e. the client has stopped ACKing), which lets smux keepalive
+//     failures surface quickly instead of blocking indefinitely.
+type rollingDeadlineRW struct {
+	conn         *kcp.UDPSession
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+}
+
+func (r *rollingDeadlineRW) Read(b []byte) (int, error) {
+	r.conn.SetReadDeadline(time.Now().Add(r.readTimeout))
+	return r.conn.Read(b)
+}
+
+func (r *rollingDeadlineRW) Write(b []byte) (int, error) {
+	r.conn.SetWriteDeadline(time.Now().Add(r.writeTimeout))
+	return r.conn.Write(b)
+}
+
+func (r *rollingDeadlineRW) Close() error {
+	return r.conn.Close()
+}
+
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
 func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
-	// Put a Noise channel on top of the KCP conn.
-	// Wrap conn with a per-write deadline so that smux keepalive writes fail
-	// fast when the client stops ACKing, rather than blocking indefinitely.
-	rw, err := noise.NewServer(conn, privkey)
+	// Put a Noise channel on top of the KCP conn, wrapped in rolling per-op
+	// deadlines so that a silently-disappeared client is detected promptly.
+	rw, err := noise.NewServer(&rollingDeadlineRW{
+		conn:         conn,
+		readTimeout:  kcpReadTimeout,
+		writeTimeout: kcpWriteTimeout,
+	}, privkey)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create noise connection: %w", err)
 	}
 
 	// Put an smux session on top of the encrypted Noise channel.
@@ -279,7 +312,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create session: %w", err)
 	}
 	defer sess.Close()
 
@@ -289,9 +322,13 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
-			return err
+			return fmt.Errorf("failed to accept stream: %w", err)
 		}
-		if err := stream.SetDeadline(time.Now().Add(kcpWriteTimeout)); err != nil {
+		// Bound the initial request phase: if the client opens a stream but
+		// never sends an HTTP request, this deadline kills it after kcpReadTimeout.
+		// handleStream clears this deadline before starting pipeData, so active
+		// connections are not capped by an absolute stream lifetime.
+		if err := stream.SetDeadline(time.Now().Add(kcpReadTimeout)); err != nil {
 			slog.Warn("failed to set stream deadline", slog.Any("err", err))
 		}
 		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
@@ -322,16 +359,14 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 		slog.Info("begin session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
-		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
-		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
-		)
-		conn.SetReadDeadline(time.Now().Add(kcpReadTimeout))
-		conn.SetWriteDeadline(time.Now().Add(kcpWriteTimeout))
+		// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
+		//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
+		//   interval=10 → flush/retransmit tick every 10 ms
+		//   resend=2   → fast-retransmit after 2 duplicate ACKs
+		//   nc=1       → disable congestion window
+		conn.SetNoDelay(1, 10, 2, 1)
+		// Send ACKs immediately rather than batching them with the next tick.
+		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
@@ -600,6 +635,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			var ok bool
 			rec, ok = <-ch
 			if !ok {
+				slog.Warn("got a invalid record, breaking sendloop")
 				break
 			}
 		}
