@@ -119,6 +119,9 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	if d.sess != nil && !d.sess.IsClosed() {
 		return nil
 	}
+	if d.pconn == nil {
+		return errors.New("no packet connection: transport dial may have failed")
+	}
 
 	// Open a KCP conn on the PacketConn.
 	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, d.pconn)
@@ -135,14 +138,16 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	d.convID = conn.GetConv()
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
-	// Disable the dynamic congestion window (limit only by the maximum of
-	// local and remote static windows).
-	conn.SetNoDelay(
-		0, // default nodelay
-		0, // default interval
-		0, // default resend
-		1, // nc=1 => congestion window off
-	)
+	// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
+	//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
+	//   interval=10 → flush/retransmit tick every 10 ms
+	//   resend=2   → fast-retransmit after 2 duplicate ACKs
+	//   nc=1       → disable congestion window (window limited only by
+	//                the static send/recv window sizes set below)
+	conn.SetNoDelay(1, 10, 2, 1)
+	// Send ACKs immediately rather than batching them with the next
+	// 10 ms tick; this lets the remote side open its send window sooner.
+	conn.SetACKNoDelay(true)
 	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 	if !conn.SetMtu(d.mtu) {
 		return fmt.Errorf("setting MTU to %d", d.mtu)
