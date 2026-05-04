@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -212,26 +213,141 @@ func (d *dnstt) getStream() (*smux.Stream, error) {
 	return stream, nil
 }
 
+// maxRoundTripRetries is the number of times a request is retried when the
+// tunnel returns a premature EOF or timeout (e.g. when the upstream server
+// times out the TLS handshake before the DNS tunnel completes it).
+const maxRoundTripRetries = 5
+
+// retryBaseDelay is the starting backoff duration before the first retry.
+// Each subsequent retry doubles the delay (capped at retryMaxDelay), with
+// ±25% random jitter applied to avoid synchronized retries.
+const retryBaseDelay = 500 * time.Millisecond
+
+// retryMaxDelay caps the exponential backoff to avoid very long waits.
+const retryMaxDelay = 5 * time.Second
+
+// streamTimeout is the per-stream deadline on the client side. It acts as a
+// safety net for a degraded KCP session: if nothing happens on a stream for
+// this long, the stream is closed with a timeout error, the session is reset,
+// and a fresh session is started on the next retry. Normal Cloudflare TLS
+// timeouts (~10s) fire well before this deadline.
+const streamTimeout = 30 * time.Second
+
 // NewRoundTripper creates a new HTTP round tripper for the given address.
 // It manages session creation and reuse.
 func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTripper, error) {
 	if d.isClosed() {
 		return nil, errors.New("dnstt is closed")
 	}
-	rt := &http.Transport{
+	inner := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			stream, err := d.getStream()
 			if err != nil {
 				return nil, fmt.Errorf("creating stream: %w", err)
 			}
 			slog.Debug(fmt.Sprintf("begin stream %08x:%d", d.convID, stream.ID()))
+			// Safety-net deadline: if the KCP session becomes degraded and
+			// stalls for longer than streamTimeout, the stream times out so
+			// the retrier can reset the session and start fresh.
+			stream.SetDeadline(time.Now().Add(streamTimeout))
 			return &conn{Stream: stream, sessID: d.convID}, nil
 		},
 		Proxy: func(*http.Request) (*url.URL, error) {
 			return url.Parse("http://127.0.0.1:8080") // dummy to force request to be sent correctly
 		},
 	}
-	return rt, nil
+	// resetSession closes the current smux session so that the next
+	// getStream call creates a new one with a clean KCP state.
+	resetSession := func() {
+		d.sessAccess.Lock()
+		if d.sess != nil {
+			d.sess.Close()
+		}
+		d.sessAccess.Unlock()
+	}
+	return &retryRoundTripper{inner: inner, maxRetries: maxRoundTripRetries, resetSession: resetSession}, nil
+}
+
+// retryRoundTripper wraps an http.Transport and retries requests that fail with
+// a premature EOF or tunnel timeout. This can happen when an upstream server
+// (e.g. Cloudflare) times out a slow TLS handshake before the DNS tunnel has
+// finished delivering all the data. On retry the DoH connection is already
+// warm, so the tunnel is faster and the handshake succeeds.
+//
+// When a tunnel timeout fires (KCP session degraded), resetSession is called
+// before the retry so the next attempt gets a fresh KCP/Noise session.
+type retryRoundTripper struct {
+	inner        *http.Transport
+	maxRetries   int
+	resetSession func() // closes the current session; next retry creates a fresh one
+}
+
+func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		if attempt > 0 {
+			if req.Body != nil && req.GetBody == nil {
+				// Cannot replay a streaming request body; give up.
+				return nil, lastErr
+			}
+
+			// Exponential backoff with ±25% jitter: gives the DoH
+			// connections time to warm up before the next attempt.
+			delay := retryBaseDelay * (1 << (attempt - 1))
+			if delay > retryMaxDelay {
+				delay = retryMaxDelay
+			}
+			jitter := time.Duration(rand.Int63n(int64(delay) / 2))
+			if rand.Intn(2) == 0 {
+				delay += jitter
+			} else {
+				delay -= jitter
+			}
+			slog.Debug("retrying request after tunnel EOF", "attempt", attempt, "error", lastErr, "backoff", delay)
+			select {
+			case <-time.After(delay):
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+
+			r.inner.CloseIdleConnections()
+			if req.GetBody != nil {
+				body, err := req.GetBody()
+				if err != nil {
+					return nil, fmt.Errorf("retrying request body: %w", err)
+				}
+				req.Body = body
+			}
+		}
+		resp, err := r.inner.RoundTrip(req)
+		if err == nil {
+			return resp, nil
+		}
+		if !isTunnelEOF(err) {
+			return nil, err
+		}
+		// If the stream timed out, the KCP session may be degraded.
+		// Reset it so the next retry gets a fresh session with a clean state.
+		if isNetTimeout(err) && r.resetSession != nil {
+			slog.Debug("stream timeout — resetting KCP session before retry", "attempt", attempt)
+			r.resetSession()
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// isTunnelEOF returns true when err represents a retryable tunnel failure:
+// a premature EOF (upstream server closed the connection) or a net timeout
+// (stream deadline fired because the KCP session was stalled).
+func isTunnelEOF(err error) bool {
+	return errors.Is(err, io.EOF) || isNetTimeout(err)
+}
+
+// isNetTimeout returns true when err is (or wraps) a net.Error with Timeout.
+func isNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // Option is a function type used to configure the dnstt instance.
@@ -416,11 +532,7 @@ func (c *conn) Write(b []byte) (int, error) {
 
 func (c *conn) Read(b []byte) (int, error) {
 	n, err := c.Stream.Read(b)
-	if err == io.EOF {
-		// smux Stream.Write may return io.EOF.
-		err = nil
-	}
-	if err != nil {
+	if err != nil && err != io.EOF {
 		id := fmt.Sprintf("%08x:%d", c.sessID, c.Stream.ID())
 		slog.Error("stream read error", "stream", id, "error", err)
 	}
