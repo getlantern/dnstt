@@ -45,6 +45,17 @@ const (
 	// https://dnsencryption.info/imc19-doe.html Section 4.2, Finding 2.4
 	maxResponseDelay = 1 * time.Second
 
+	// Number of sendLoop goroutines to run concurrently. Each goroutine
+	// holds one DNS response open (for up to maxResponseDelay) to bundle
+	// downstream packets into it before sending. More goroutines allow
+	// more queries to be served in parallel: each active client sends up
+	// to 16 concurrent polls (client-side pollLimit), so this value should
+	// comfortably exceed the expected number of simultaneous clients × 16.
+	// The receive channel (same capacity) absorbs bursts beyond this limit;
+	// excess queries are dropped by recvLoop (non-blocking send) and retried
+	// by the client. Goroutine overhead is negligible (~8 KB stack each).
+	numSendLoops = 100
+
 	// How long to wait for a TCP connection to upstream to be established.
 	upstreamDialTimeout = 30 * time.Second
 
@@ -867,13 +878,13 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 		}
 	}()
 
-	ch := make(chan *record, 100)
+	ch := make(chan *record, numSendLoops)
 	defer close(ch)
 
 	// We could run multiple copies of sendLoop; that would allow more time
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
-	for i := 0; i < 10; i++ {
+	for i := 0; i < numSendLoops; i++ {
 		go func() {
 			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
 			if err != nil {
