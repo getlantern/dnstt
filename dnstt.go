@@ -244,6 +244,17 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 		Proxy: func(*http.Request) (*url.URL, error) {
 			return url.Parse("http://127.0.0.1:8080") // dummy to force request to be sent correctly
 		},
+		// A persistent TLS session cache allows session resumption (TLS 1.3
+		// PSK / TLS 1.2 session tickets) for subsequent connections to the
+		// same host. Without this, every smux stream requires a full TLS
+		// handshake (~7-9 DNS round trips for the server Certificate alone at
+		// 135-byte MTU). With session resumption, subsequent handshakes are
+		// 1-RTT (~200ms) instead of ~8s, which is critical for redirect chains
+		// where each hop to the same host otherwise triggers a fresh handshake
+		// that exceeds many upstream servers' TLS negotiation timeouts.
+		TLSClientConfig: &tls.Config{
+			ClientSessionCache: tls.NewLRUClientSessionCache(64),
+		},
 	}
 	// resetSession closes the current smux session so that the next
 	// getStream call creates a new one with a clean KCP state.
