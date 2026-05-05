@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"net"
 	"runtime"
 	"testing"
@@ -19,7 +20,7 @@ func TestPipeDataExitsOnStreamClose(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pipeData(stream, targetConn)
+		pipeData(stream, bufio.NewReader(stream), targetConn)
 		close(done)
 	}()
 
@@ -41,7 +42,7 @@ func TestPipeDataExitsOnTargetConnClose(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pipeData(stream, targetConn)
+		pipeData(stream, bufio.NewReader(stream), targetConn)
 		close(done)
 	}()
 
@@ -92,7 +93,7 @@ func TestPipeDataExitsOnHungTarget(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pipeData(stream, targetConn)
+		pipeData(stream, bufio.NewReader(stream), targetConn)
 		close(done)
 	}()
 
@@ -114,7 +115,7 @@ func TestPipeDataNoGoroutineLeak(t *testing.T) {
 		stream, streamPeer := net.Pipe()
 		targetConn, targetPeer := net.Pipe()
 
-		go pipeData(stream, targetConn)
+		go pipeData(stream, bufio.NewReader(stream), targetConn)
 
 		// Close both remote ends so pipeData drains immediately.
 		streamPeer.Close()
