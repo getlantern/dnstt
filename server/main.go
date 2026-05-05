@@ -51,10 +51,16 @@ const (
 	// more queries to be served in parallel: each active client sends up
 	// to 16 concurrent polls (client-side pollLimit), so this value should
 	// comfortably exceed the expected number of simultaneous clients × 16.
-	// The receive channel (same capacity) absorbs bursts beyond this limit;
-	// excess queries are dropped by recvLoop (non-blocking send) and retried
-	// by the client. Goroutine overhead is negligible (~8 KB stack each).
+	// Goroutine overhead is negligible (~8 KB stack each).
 	numSendLoops = 100
+
+	// Size of the channel that feeds records from recvLoop to the sendLoop
+	// goroutines. Sized well above numSendLoops so that recvLoop's
+	// non-blocking send (default: drop) does not lose records during bursts
+	// where all numSendLoops goroutines are busy holding a response open for
+	// up to maxResponseDelay. A drop means the client's DNS query goes
+	// unanswered, slowing downstream delivery until the next poll.
+	sendLoopChanSize = numSendLoops * 10
 
 	// How long to wait for a TCP connection to upstream to be established.
 	upstreamDialTimeout = 30 * time.Second
@@ -72,8 +78,19 @@ const (
 	// this deadline enforced on every write, the smux keepalive goroutine —
 	// which writes a ping every 10 s — will fail fast rather than blocking
 	// indefinitely, allowing smux to detect and close the dead session.
-	kcpWriteTimeout = 30 * time.Second
-	kcpReadTimeout  = 60 * time.Second
+	// kcpWriteTimeout is the per-op write deadline on the KCP session. It
+	// must be large enough to survive a full KCP send window filling up
+	// while the client is busy doing a slow TLS handshake over DNS. DNS
+	// round trips are ~200ms and a TLS Certificate can be 3-8KB, so
+	// ~22+ DNS trips for the cert alone ≈ 4-5s. With KCP congestion window
+	// disabled (nc=1) and smux keepalives at 10s, 120s gives plenty of
+	// margin for the application data phase without pinning zombie sessions.
+	kcpWriteTimeout = 120 * time.Second
+	// kcpReadTimeout is the per-op read deadline on the KCP session. If no
+	// data arrives for this long, the client has silently disappeared. Must
+	// be larger than the longest possible idle gap (client-side poll
+	// backs off to maxPollDelay=10s, so 120s is comfortably above that).
+	kcpReadTimeout = 120 * time.Second
 )
 
 var (
@@ -185,7 +202,18 @@ func readKeyFromFile(filename string) ([]byte, error) {
 
 // handleStream acts as a basic HTTP proxy, connecting a client stream to the requested HTTP target.
 func handleStream(stream *smux.Stream, conv uint32) error {
-	req, err := http.ReadRequest(bufio.NewReader(stream))
+	// Set the deadline now (inside the goroutine) so the clock starts
+	// when the goroutine is actually running, not before it is scheduled.
+	if err := stream.SetDeadline(time.Now().Add(kcpReadTimeout)); err != nil {
+		slog.Warn("failed to set stream deadline", slog.Any("err", err))
+	}
+
+	// Use a single bufio.Reader for the entire lifetime of this stream.
+	// http.ReadRequest may pre-fetch bytes beyond the request headers into
+	// the buffer; we must pass the same reader to pipeData so those bytes
+	// are not silently dropped when we copy client→target data.
+	br := bufio.NewReader(stream)
+	req, err := http.ReadRequest(br)
 	if err != nil {
 		return fmt.Errorf("stream %08x:%d HTTP request read: %v", conv, stream.ID(), err)
 	}
@@ -248,17 +276,29 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 	// Clear the stream deadline before piping: the request phase is done, so
 	// pipeData can run for as long as the upstream connection is alive.
 	stream.SetDeadline(time.Time{})
-	pipeData(stream, targetConn)
+	pipeData(stream, br, targetConn)
 	return nil
 }
 
-func pipeData(stream, targetConn io.ReadWriteCloser) {
+// pipeData bidirectionally copies between the smux stream and the upstream TCP
+// connection. br must be the same bufio.Reader used by http.ReadRequest so that
+// any bytes pre-fetched into its buffer are not lost.
+//
+// We drain br's internal buffer first (via io.CopyN), then copy the raw stream
+// directly. We deliberately avoid io.Copy(targetConn, br) because
+// bufio.Reader implements io.WriterTo, and WriteTo unconditionally calls
+// targetConn.Write(empty) before filling its buffer — a 0-byte write that
+// blocks forever on net.Pipe connections and stalls in production.
+func pipeData(stream io.ReadWriteCloser, br *bufio.Reader, targetConn io.ReadWriteCloser) {
 	done := make(chan struct{})
 	go func() {
 		io.Copy(stream, targetConn)
 		stream.Close()
 		close(done)
 	}()
+	if n := br.Buffered(); n > 0 {
+		io.CopyN(targetConn, br, int64(n)) //nolint:errcheck
+	}
 	io.Copy(targetConn, stream)
 	targetConn.Close()
 	<-done // Wait for the stream to close.
@@ -323,13 +363,6 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 				continue
 			}
 			return fmt.Errorf("failed to accept stream: %w", err)
-		}
-		// Bound the initial request phase: if the client opens a stream but
-		// never sends an HTTP request, this deadline kills it after kcpReadTimeout.
-		// handleStream clears this deadline before starting pipeData, so active
-		// connections are not capped by an absolute stream lifetime.
-		if err := stream.SetDeadline(time.Now().Add(kcpReadTimeout)); err != nil {
-			slog.Warn("failed to set stream deadline", slog.Any("err", err))
 		}
 		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 		go func() {
@@ -914,7 +947,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 		}
 	}()
 
-	ch := make(chan *record, numSendLoops)
+	ch := make(chan *record, sendLoopChanSize)
 	defer close(ch)
 
 	// We could run multiple copies of sendLoop; that would allow more time
