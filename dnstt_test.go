@@ -1,13 +1,12 @@
 package dnstt
 
 import (
+	"bytes"
 	"context"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"testing"
-	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/stretchr/testify/assert"
