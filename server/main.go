@@ -668,7 +668,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			var ok bool
 			rec, ok = <-ch
 			if !ok {
-				slog.Warn("got a invalid record, breaking sendloop")
+				slog.Debug("closing sendLoop")
 				break
 			}
 		}

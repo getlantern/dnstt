@@ -323,6 +323,14 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		if err == nil {
 			return resp, nil
 		}
+		// A deadline or cancellation on the caller's context must not be
+		// treated as a tunnel failure: *url.Error wrapping
+		// context.DeadlineExceeded satisfies net.Error.Timeout(), which
+		// would otherwise trigger resetSession() and disrupt every
+		// concurrent RoundTrip sharing the same smux session.
+		if req.Context().Err() != nil {
+			return nil, req.Context().Err()
+		}
 		if !isTunnelEOF(err) {
 			return nil, err
 		}
