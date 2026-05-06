@@ -12,9 +12,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"strings"
@@ -44,8 +45,52 @@ const (
 	// https://dnsencryption.info/imc19-doe.html Section 4.2, Finding 2.4
 	maxResponseDelay = 1 * time.Second
 
+	// Number of sendLoop goroutines to run concurrently. Each goroutine
+	// holds one DNS response open (for up to maxResponseDelay) to bundle
+	// downstream packets into it before sending. More goroutines allow
+	// more queries to be served in parallel: each active client sends up
+	// to 16 concurrent polls (client-side pollLimit), so this value should
+	// comfortably exceed the expected number of simultaneous clients × 16.
+	// Goroutine overhead is negligible (~8 KB stack each).
+	numSendLoops = 100
+
+	// Size of the channel that feeds records from recvLoop to the sendLoop
+	// goroutines. Sized well above numSendLoops so that recvLoop's
+	// non-blocking send (default: drop) does not lose records during bursts
+	// where all numSendLoops goroutines are busy holding a response open for
+	// up to maxResponseDelay. A drop means the client's DNS query goes
+	// unanswered, slowing downstream delivery until the next poll.
+	sendLoopChanSize = numSendLoops * 10
+
 	// How long to wait for a TCP connection to upstream to be established.
 	upstreamDialTimeout = 30 * time.Second
+
+	// How frequently to send TCP keepalive probes to upstream targets. The OS
+	// closes the connection after a system-dependent number of missed probes
+	// (typically ~9 on Linux with the default 75 s probe interval, so ~11 min
+	// total). A short period here means a hung upstream is detected and the
+	// pipeData goroutines unblocked much sooner.
+	upstreamKeepalivePeriod = 30 * time.Second
+
+	// How long a single KCP write may block before the session is considered
+	// dead. Writes stall when the remote client stops ACKing (KCP send-window
+	// full), which is the main symptom of a silently-disappeared client. With
+	// this deadline enforced on every write, the smux keepalive goroutine —
+	// which writes a ping every 10 s — will fail fast rather than blocking
+	// indefinitely, allowing smux to detect and close the dead session.
+	// kcpWriteTimeout is the per-op write deadline on the KCP session. It
+	// must be large enough to survive a full KCP send window filling up
+	// while the client is busy doing a slow TLS handshake over DNS. DNS
+	// round trips are ~200ms and a TLS Certificate can be 3-8KB, so
+	// ~22+ DNS trips for the cert alone ≈ 4-5s. With KCP congestion window
+	// disabled (nc=1) and smux keepalives at 10s, 120s gives plenty of
+	// margin for the application data phase without pinning zombie sessions.
+	kcpWriteTimeout = 120 * time.Second
+	// kcpReadTimeout is the per-op read deadline on the KCP session. If no
+	// data arrives for this long, the client has silently disappeared. Must
+	// be larger than the longest possible idle gap (client-side poll
+	// backs off to maxPollDelay=10s, so 120s is comfortably above that).
+	kcpReadTimeout = 120 * time.Second
 )
 
 var (
@@ -157,7 +202,18 @@ func readKeyFromFile(filename string) ([]byte, error) {
 
 // handleStream acts as a basic HTTP proxy, connecting a client stream to the requested HTTP target.
 func handleStream(stream *smux.Stream, conv uint32) error {
-	req, err := http.ReadRequest(bufio.NewReader(stream))
+	// Set the deadline now (inside the goroutine) so the clock starts
+	// when the goroutine is actually running, not before it is scheduled.
+	if err := stream.SetDeadline(time.Now().Add(kcpReadTimeout)); err != nil {
+		slog.Warn("failed to set stream deadline", slog.Any("err", err))
+	}
+
+	// Use a single bufio.Reader for the entire lifetime of this stream.
+	// http.ReadRequest may pre-fetch bytes beyond the request headers into
+	// the buffer; we must pass the same reader to pipeData so those bytes
+	// are not silently dropped when we copy client→target data.
+	br := bufio.NewReader(stream)
+	req, err := http.ReadRequest(br)
 	if err != nil {
 		return fmt.Errorf("stream %08x:%d HTTP request read: %v", conv, stream.ID(), err)
 	}
@@ -191,6 +247,19 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 		return fmt.Errorf("stream %08x:%d connect target %s: %v", conv, stream.ID(), targetAddr, err)
 	}
 	defer targetConn.Close()
+	// Enable TCP keepalives so the OS can detect and close connections to
+	// upstream targets that stop responding without sending FIN/RST. Without
+	// this, a hung server holds the pipeData goroutines open indefinitely.
+	// Keepalives are best-effort: log failures but do not abort the stream,
+	// since the proxy still works correctly; it just loses the early-detection
+	// safety net on platforms where these syscalls are unsupported.
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		if err := tc.SetKeepAlive(true); err != nil {
+			slog.Warn("SetKeepAlive failed", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
+		} else if err := tc.SetKeepAlivePeriod(upstreamKeepalivePeriod); err != nil {
+			slog.Warn("SetKeepAlivePeriod failed", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
+		}
+	}
 
 	if req.Method == "CONNECT" {
 		// HTTP tunnel
@@ -204,29 +273,76 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 		}
 	}
 
-	pipeData(stream, targetConn)
+	// Clear the stream deadline before piping: the request phase is done, so
+	// pipeData can run for as long as the upstream connection is alive.
+	stream.SetDeadline(time.Time{})
+	pipeData(stream, br, targetConn)
 	return nil
 }
 
-func pipeData(stream, targetConn io.ReadWriteCloser) {
+// pipeData bidirectionally copies between the smux stream and the upstream TCP
+// connection. br must be the same bufio.Reader used by http.ReadRequest so that
+// any bytes pre-fetched into its buffer are not lost.
+//
+// We drain br's internal buffer first (via io.CopyN), then copy the raw stream
+// directly. We deliberately avoid io.Copy(targetConn, br) because
+// bufio.Reader implements io.WriterTo, and WriteTo unconditionally calls
+// targetConn.Write(empty) before filling its buffer — a 0-byte write that
+// blocks forever on net.Pipe connections and stalls in production.
+func pipeData(stream io.ReadWriteCloser, br *bufio.Reader, targetConn io.ReadWriteCloser) {
 	done := make(chan struct{})
 	go func() {
 		io.Copy(stream, targetConn)
 		stream.Close()
 		close(done)
 	}()
+	if n := br.Buffered(); n > 0 {
+		io.CopyN(targetConn, br, int64(n)) //nolint:errcheck
+	}
 	io.Copy(targetConn, stream)
 	targetConn.Close()
 	<-done // Wait for the stream to close.
 }
 
+// rollingDeadlineRW wraps a kcp.UDPSession and resets read/write deadlines on
+// every I/O call. This ensures:
+//   - Reads time out if no data arrives within kcpReadTimeout (detects a stalled
+//     session where the client has silently disappeared and stopped querying).
+//   - Writes time out within kcpWriteTimeout if the client's KCP receive window
+//     is full (i.e. the client has stopped ACKing), which lets smux keepalive
+//     failures surface quickly instead of blocking indefinitely.
+type rollingDeadlineRW struct {
+	conn         *kcp.UDPSession
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+}
+
+func (r *rollingDeadlineRW) Read(b []byte) (int, error) {
+	r.conn.SetReadDeadline(time.Now().Add(r.readTimeout))
+	return r.conn.Read(b)
+}
+
+func (r *rollingDeadlineRW) Write(b []byte) (int, error) {
+	r.conn.SetWriteDeadline(time.Now().Add(r.writeTimeout))
+	return r.conn.Write(b)
+}
+
+func (r *rollingDeadlineRW) Close() error {
+	return r.conn.Close()
+}
+
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
 func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewServer(conn, privkey)
+	// Put a Noise channel on top of the KCP conn, wrapped in rolling per-op
+	// deadlines so that a silently-disappeared client is detected promptly.
+	rw, err := noise.NewServer(&rollingDeadlineRW{
+		conn:         conn,
+		readTimeout:  kcpReadTimeout,
+		writeTimeout: kcpWriteTimeout,
+	}, privkey)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create noise connection: %w", err)
 	}
 
 	// Put an smux session on top of the encrypted Noise channel.
@@ -236,7 +352,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create session: %w", err)
 	}
 	defer sess.Close()
 
@@ -246,17 +362,17 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
 				continue
 			}
-			return err
+			return fmt.Errorf("failed to accept stream: %w", err)
 		}
-		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
+		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 		go func() {
 			defer func() {
-				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
+				slog.Info("end stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 				stream.Close()
 			}()
 			err := handleStream(stream, conn.GetConv())
 			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				slog.Error("handleStream failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
 			}
 		}()
 	}
@@ -273,29 +389,29 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 			}
 			return err
 		}
-		log.Printf("begin session %08x", conn.GetConv())
+		slog.Info("begin session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
-		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
-		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
-		)
+		// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
+		//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
+		//   interval=10 → flush/retransmit tick every 10 ms
+		//   resend=2   → fast-retransmit after 2 duplicate ACKs
+		//   nc=1       → disable congestion window
+		conn.SetNoDelay(1, 10, 2, 1)
+		// Send ACKs immediately rather than batching them with the next tick.
+		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
 		}
 		go func() {
 			defer func() {
-				log.Printf("end session %08x", conn.GetConv())
+				slog.Info("end session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 				conn.Close()
 			}()
 			err := acceptStreams(conn, privkey)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
+				slog.Error("acceptStreams failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("err", err))
 			}
 		}()
 	}
@@ -372,7 +488,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// "If a query message with more than one OPT RR is
 			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
-			log.Printf("FORMERR: more than one OPT RR")
+			slog.Warn("FORMERR: more than one OPT RR")
 			return resp, nil
 		}
 		resp.Additional = append(resp.Additional, dns.RR{
@@ -392,7 +508,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
-			log.Printf("BADVERS: EDNS version %d != 0", version)
+			slog.Warn("BADVERS: unsupported EDNS version", slog.Any("version", version))
 			return resp, nil
 		}
 
@@ -409,7 +525,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// There must be exactly one question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
+		slog.Warn("FORMERR: unexpected question count", slog.Any("count", len(query.Question)))
 		return resp, nil
 	}
 	question := query.Question[0]
@@ -421,7 +537,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if !ok {
 		// Not a name we are authoritative for.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
+		slog.Warn("NXDOMAIN: not authoritative", slog.Any("name", question.Name))
 		return resp, nil
 	}
 	resp.Flags |= 0x0400 // AA = 1
@@ -429,7 +545,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if query.Opcode() != 0 {
 		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
-		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
+		slog.Warn("NOTIMPL: unrecognized OPCODE", slog.Any("opcode", query.Opcode()))
 		return resp, nil
 	}
 
@@ -450,7 +566,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	if err != nil {
 		// Base32 error, make like the name doesn't exist.
 		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: base32 decoding: %v", err)
+		slog.Warn("NXDOMAIN: base32 decoding error", slog.Any("err", err))
 		return resp, nil
 	}
 	payload = payload[:n]
@@ -463,7 +579,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	// FORMERR MUST be returned."
 	if payloadSize < maxUDPPayload {
 		resp.Flags |= dns.RcodeFormatError
-		log.Printf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
+		slog.Warn("FORMERR: requester payload too small", slog.Any("payload_size", payloadSize), slog.Any("minimum", maxUDPPayload))
 		return resp, nil
 	}
 
@@ -491,7 +607,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		n, addr, err := dnsConn.ReadFrom(buf[:])
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("ReadFrom temporary error: %v", err)
+				slog.Warn("ReadFrom temporary error", slog.Any("err", err))
 				continue
 			}
 			return err
@@ -500,7 +616,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		// Got a UDP packet. Try to parse it as a DNS message.
 		query, err := dns.MessageFromWireFormat(buf[:n])
 		if err != nil {
-			log.Printf("cannot parse DNS query: %v", err)
+			slog.Warn("cannot parse DNS query", slog.Any("err", err))
 			continue
 		}
 
@@ -525,7 +641,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			// Payload is not long enough to contain a ClientID.
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+				slog.Warn("NXDOMAIN: payload too short for ClientID", slog.Any("bytes", n))
 			}
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
@@ -552,6 +668,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			var ok bool
 			rec, ok = <-ch
 			if !ok {
+				slog.Debug("closing sendLoop")
 				break
 			}
 		}
@@ -640,13 +757,13 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 		buf, err := rec.Resp.WireFormat()
 		if err != nil {
-			log.Printf("resp WireFormat: %v", err)
+			slog.Error("resp WireFormat error", slog.Any("err", err))
 			continue
 		}
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
 		if len(buf) > maxUDPPayload {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
+			slog.Debug("truncating response", slog.Any("size", len(buf)), slog.Any("max", maxUDPPayload))
 			buf = buf[:maxUDPPayload]
 			buf[2] |= 0x02 // TC = 1
 		}
@@ -655,7 +772,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		_, err = dnsConn.WriteTo(buf, rec.Addr)
 		if err != nil {
 			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("WriteTo temporary error: %v", err)
+				slog.Warn("WriteTo temporary error", slog.Any("err", err))
 				continue
 			}
 			return err
@@ -816,7 +933,7 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	}
 
 	// Start up the virtual PacketConn for turbotunnel.
-	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
+	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout)
 	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
 	if err != nil {
 		return fmt.Errorf("opening KCP listener: %v", err)
@@ -826,24 +943,34 @@ func run(privkey []byte, domain dns.Name, dnsConn net.PacketConn) error {
 	go func() {
 		err := acceptSessions(ln, privkey, mtu)
 		if err != nil {
-			log.Printf("acceptSessions: %v", err)
+			slog.Error("acceptSessions error", slog.Any("err", err))
 		}
 	}()
 
-	ch := make(chan *record, 100)
+	ch := make(chan *record, sendLoopChanSize)
 	defer close(ch)
 
 	// We could run multiple copies of sendLoop; that would allow more time
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
-	go func() {
-		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
-		if err != nil {
-			log.Printf("sendLoop: %v", err)
-		}
-	}()
+	for i := 0; i < numSendLoops; i++ {
+		go func() {
+			err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload)
+			if err != nil {
+				slog.Error("sendLoop error", slog.Any("err", err))
+			}
+		}()
+	}
 
 	return recvLoop(domain, dnsConn, ttConn, ch)
+}
+
+func startPprof() {
+	go func() {
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			slog.Error("pprof server stopped", slog.Any("err", err))
+		}
+	}()
 }
 
 func main() {
@@ -873,7 +1000,14 @@ Example:
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.LUTC)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				a.Value = slog.TimeValue(a.Value.Time().UTC())
+			}
+			return a
+		},
+	})))
 
 	if genKey {
 		// -gen-key mode.
@@ -942,8 +1076,8 @@ Example:
 			}
 		}
 		if len(privkey) == 0 {
-			log.Println("generating a temporary one-time keypair")
-			log.Println("use the -privkey or -privkey-file option for a persistent server keypair")
+			slog.Warn("generating a temporary one-time keypair")
+			slog.Warn("use the -privkey or -privkey-file option for a persistent server keypair")
 			var err error
 			privkey, err = noise.GeneratePrivkey()
 			if err != nil {
@@ -952,9 +1086,14 @@ Example:
 			}
 		}
 
+		pprofDebug := strings.TrimSpace(os.Getenv("PPROF_DEBUG"))
+		if pprofDebug != "" && pprofDebug != "0" && !strings.EqualFold(pprofDebug, "false") {
+			startPprof()
+		}
 		err = run(privkey, domain, dnsConn)
 		if err != nil {
-			log.Fatal(err)
+			slog.Error("run failed", slog.Any("err", err))
+			os.Exit(1)
 		}
 	}
 }
