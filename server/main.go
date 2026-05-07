@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
@@ -23,6 +24,11 @@ import (
 
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
@@ -109,6 +115,46 @@ var (
 	// of 1232. Cloudflare's was 1452, and Google's was 4096.
 	maxUDPPayload = 1280 - 40 - 8
 )
+
+const tracerName = "github.com/getlantern/dnstt/server"
+
+var (
+	serverSessions      metric.Int64Counter
+	serverStreams       metric.Int64Counter
+	serverRequests      metric.Int64Counter
+	serverRequestErrors metric.Int64Counter
+)
+
+func initServerTelemetry() {
+	meter := otel.GetMeterProvider().Meter(tracerName)
+	var err error
+	if serverSessions, err = meter.Int64Counter("dnstt.server.sessions"); err != nil {
+		slog.Warn("failed to create sessions metric", slog.Any("err", err))
+	}
+	if serverStreams, err = meter.Int64Counter("dnstt.server.streams"); err != nil {
+		slog.Warn("failed to create streams metric", slog.Any("err", err))
+	}
+	if serverRequests, err = meter.Int64Counter("dnstt.server.requests"); err != nil {
+		slog.Warn("failed to create requests metric", slog.Any("err", err))
+	}
+	if serverRequestErrors, err = meter.Int64Counter("dnstt.server.requests.errors"); err != nil {
+		slog.Warn("failed to create request errors metric", slog.Any("err", err))
+	}
+}
+
+// otlpHeaders is a repeatable -otel-header flag that accumulates key=value OTLP headers.
+type otlpHeaders map[string]string
+
+func (h otlpHeaders) String() string { return fmt.Sprintf("%v", map[string]string(h)) }
+
+func (h otlpHeaders) Set(s string) error {
+	k, v, ok := strings.Cut(s, "=")
+	if !ok {
+		return fmt.Errorf("invalid header %q: must be key=value", s)
+	}
+	h[k] = v
+	return nil
+}
 
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -201,7 +247,7 @@ func readKeyFromFile(filename string) ([]byte, error) {
 }
 
 // handleStream acts as a basic HTTP proxy, connecting a client stream to the requested HTTP target.
-func handleStream(stream *smux.Stream, conv uint32) error {
+func handleStream(ctx context.Context, stream *smux.Stream, conv uint32) error {
 	// Set the deadline now (inside the goroutine) so the clock starts
 	// when the goroutine is actually running, not before it is scheduled.
 	if err := stream.SetDeadline(time.Now().Add(kcpReadTimeout)); err != nil {
@@ -230,6 +276,7 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 	dialer := net.Dialer{
 		Timeout: upstreamDialTimeout,
 	}
+	serverRequests.Add(ctx, 1)
 	targetConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
 		if req.Method == "CONNECT" {
@@ -244,6 +291,7 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 			}
 			resp.Write(stream)
 		}
+		serverRequestErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
 		return fmt.Errorf("stream %08x:%d connect target %s: %v", conv, stream.ID(), targetAddr, err)
 	}
 	defer targetConn.Close()
@@ -269,6 +317,7 @@ func handleStream(stream *smux.Stream, conv uint32) error {
 		req.RequestURI = "" // Required by http.Request.Write
 		err = req.Write(targetConn)
 		if err != nil {
+			serverRequestErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
 			return fmt.Errorf("stream %08x:%d forward HTTP request: %v", conv, stream.ID(), err)
 		}
 	}
@@ -333,7 +382,12 @@ func (r *rollingDeadlineRW) Close() error {
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
+func acceptStreams(ctx context.Context, conn *kcp.UDPSession, privkey []byte) error {
+	sessCtx, sessSpan := otel.Tracer(tracerName).Start(ctx, "dnstt.server.session",
+		trace.WithAttributes(attribute.String("conv_id", fmt.Sprintf("%08x", conn.GetConv()))))
+	defer sessSpan.End()
+	serverSessions.Add(sessCtx, 1)
+
 	// Put a Noise channel on top of the KCP conn, wrapped in rolling per-op
 	// deadlines so that a silently-disappeared client is detected promptly.
 	rw, err := noise.NewServer(&rollingDeadlineRW{
@@ -366,12 +420,23 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte) error {
 		}
 		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 		go func() {
+			streamCtx, streamSpan := otel.Tracer(tracerName).Start(sessCtx, "dnstt.server.stream",
+				trace.WithAttributes(
+					attribute.String("conv_id", fmt.Sprintf("%08x", conn.GetConv())),
+					attribute.Int("stream_id", int(stream.ID())),
+				))
+			defer streamSpan.End()
+			serverStreams.Add(streamCtx, 1, metric.WithAttributes(
+				attribute.String("conv_id", fmt.Sprintf("%08x", conn.GetConv())),
+			))
 			defer func() {
 				slog.Info("end stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
 				stream.Close()
 			}()
-			err := handleStream(stream, conn.GetConv())
+			err := handleStream(streamCtx, stream, conn.GetConv())
 			if err != nil {
+				streamSpan.RecordError(err)
+				streamSpan.SetStatus(codes.Error, err.Error())
 				slog.Error("handleStream failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
 			}
 		}()
@@ -409,7 +474,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 				slog.Info("end session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 				conn.Close()
 			}()
-			err := acceptStreams(conn, privkey)
+			err := acceptStreams(context.Background(), conn, privkey)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				slog.Error("acceptStreams failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("err", err))
 			}
@@ -979,6 +1044,8 @@ func main() {
 	var privkeyString string
 	var pubkeyFilename string
 	var udpAddr string
+	var otelEndpoint string
+	otelHeaders := otlpHeaders{}
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -998,6 +1065,8 @@ Example:
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
+	flag.StringVar(&otelEndpoint, "otel-endpoint", "", "OTLP HTTP endpoint for traces and metrics")
+	flag.Var(otelHeaders, "otel-header", "OTLP header in key=value format; may be repeated")
 	flag.Parse()
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -1008,6 +1077,16 @@ Example:
 			return a
 		},
 	})))
+
+	if otelEndpoint != "" {
+		otelShutdown, err := initOTel(context.Background(), otelEndpoint, otelHeaders)
+		if err != nil {
+			slog.Error("failed to initialize OpenTelemetry", slog.Any("err", err))
+			os.Exit(1)
+		}
+		defer otelShutdown(context.Background())
+	}
+	initServerTelemetry()
 
 	if genKey {
 		// -gen-key mode.
