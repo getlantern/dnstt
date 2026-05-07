@@ -22,6 +22,10 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
@@ -30,6 +34,8 @@ import (
 const (
 	// defaultUTLSDistribution is used to generate a `utls.ClientHelloID` when none is provided.
 	defaultUTLSDistribution = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
+
+	tracerName = "github.com/getlantern/dnstt"
 )
 
 // DNSTT defines the interface for a DNS-based tunneling transport.
@@ -56,6 +62,10 @@ type dnstt struct {
 
 	pconn  net.PacketConn
 	convID uint32
+
+	// sessCancel cancels the context passed to the session span goroutine.
+	// Protected by sessAccess.
+	sessCancel context.CancelFunc
 }
 
 // NewDNSTT creates a new DNSTT instance with the provided options. If no options are provided for
@@ -104,6 +114,10 @@ func (d *dnstt) Close() error {
 	}
 	d.sessAccess.Lock()
 	defer d.sessAccess.Unlock()
+	if d.sessCancel != nil {
+		d.sessCancel()
+		d.sessCancel = nil
+	}
 	if d.sess != nil {
 		return d.sess.Close()
 	}
@@ -119,6 +133,10 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	defer d.sessAccess.Unlock()
 	if d.sess != nil && !d.sess.IsClosed() {
 		return nil
+	}
+	if d.sessCancel != nil {
+		d.sessCancel()
+		d.sessCancel = nil
 	}
 	if d.pconn == nil {
 		return errors.New("no packet connection: transport dial may have failed")
@@ -180,6 +198,15 @@ func (d *dnstt) maybeCreateSession() (err error) {
 		return errors.New("dnstt is closed")
 	}
 
+	convID := d.convID
+	sessCtx, cancel := context.WithCancel(context.Background())
+	d.sessCancel = cancel
+	go func() {
+		_, span := otel.Tracer(tracerName).Start(sessCtx, "dnstt.session",
+			trace.WithAttributes(attribute.String("conv_id", fmt.Sprintf("%08x", convID))))
+		defer span.End()
+		<-sessCtx.Done()
+	}()
 	slog.Debug("begin session", "sessionID", fmt.Sprintf("%08x", d.convID))
 	return nil
 }
@@ -234,12 +261,20 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 	}
 	inner := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			_, streamSpan := otel.Tracer(tracerName).Start(ctx, "dnstt.stream")
 			stream, err := d.getStream()
 			if err != nil {
+				streamSpan.RecordError(err)
+				streamSpan.SetStatus(codes.Error, err.Error())
+				streamSpan.End()
 				return nil, fmt.Errorf("creating stream: %w", err)
 			}
+			streamSpan.SetAttributes(
+				attribute.String("conv_id", fmt.Sprintf("%08x", d.convID)),
+				attribute.Int("stream_id", int(stream.ID())),
+			)
 			slog.DebugContext(ctx, "begin stream", slog.String("convID", fmt.Sprintf("%08x", d.convID)), slog.Uint64("streamID", uint64(stream.ID())))
-			return &conn{Stream: stream, sessID: d.convID}, nil
+			return &conn{Stream: stream, sessID: d.convID, span: streamSpan}, nil
 		},
 		Proxy: func(*http.Request) (*url.URL, error) {
 			return url.Parse("http://127.0.0.1:8080") // dummy to force request to be sent correctly
@@ -260,12 +295,20 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 	// getStream call creates a new one with a clean KCP state.
 	resetSession := func() {
 		d.sessAccess.Lock()
+		if d.sessCancel != nil {
+			d.sessCancel()
+			d.sessCancel = nil
+		}
 		if d.sess != nil {
 			d.sess.Close()
 		}
 		d.sessAccess.Unlock()
 	}
-	return &retryRoundTripper{inner: inner, maxRetries: maxRoundTripRetries, resetSession: resetSession}, nil
+	return &retryRoundTripper{
+		inner:            inner,
+		maxRetries:       maxRoundTripRetries,
+		resetSession:     resetSession,
+	}, nil
 }
 
 // retryRoundTripper wraps an http.Transport and retries requests that fail with
@@ -283,6 +326,15 @@ type retryRoundTripper struct {
 }
 
 func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, span := otel.Tracer(tracerName).Start(req.Context(), "dnstt.request",
+		trace.WithAttributes(
+			attribute.String("http.request.method", req.Method),
+			attribute.String("url.full", req.URL.String()),
+		),
+	)
+	defer span.End()
+	req = req.WithContext(ctx)
+
 	var lastErr error
 	for attempt := 0; attempt <= r.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -321,6 +373,10 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 		resp, err := r.inner.RoundTrip(req)
 		if err == nil {
+			span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+			if resp.StatusCode >= 400 {
+				span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", resp.StatusCode))
+			}
 			return resp, nil
 		}
 		// A deadline or cancellation on the caller's context must not be
@@ -342,6 +398,8 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 		lastErr = err
 	}
+	span.RecordError(lastErr)
+	span.SetStatus(codes.Error, lastErr.Error())
 	return nil, lastErr
 }
 
@@ -523,6 +581,7 @@ func (d *dotDialer) String() string { return "DoT[" + d.addr + "]" }
 type conn struct {
 	*smux.Stream
 	sessID uint32
+	span   trace.Span
 }
 
 func (c *conn) Write(b []byte) (int, error) {
@@ -548,6 +607,7 @@ func (c *conn) Read(b []byte) (int, error) {
 }
 
 func (c *conn) Close() error {
+	defer c.span.End()
 	slog.Debug("closing conn", "streamID", c.Stream.ID())
 	return c.Stream.Close()
 }
