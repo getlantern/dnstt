@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
@@ -291,7 +292,7 @@ func handleStream(ctx context.Context, stream *smux.Stream, conv uint32) error {
 			}
 			resp.Write(stream)
 		}
-		serverRequestErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
+		serverRequestErrors.Add(ctx, 1, metric.WithAttributes(semconv.ErrorTypeKey.String(fmt.Sprintf("%T", err))))
 		return fmt.Errorf("stream %08x:%d connect target %s: %v", conv, stream.ID(), targetAddr, err)
 	}
 	defer targetConn.Close()
@@ -317,7 +318,7 @@ func handleStream(ctx context.Context, stream *smux.Stream, conv uint32) error {
 		req.RequestURI = "" // Required by http.Request.Write
 		err = req.Write(targetConn)
 		if err != nil {
-			serverRequestErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("error.type", err.Error())))
+			serverRequestErrors.Add(ctx, 1, metric.WithAttributes(semconv.ErrorTypeKey.String(fmt.Sprintf("%T", err))))
 			return fmt.Errorf("stream %08x:%d forward HTTP request: %v", conv, stream.ID(), err)
 		}
 	}
@@ -418,28 +419,27 @@ func acceptStreams(ctx context.Context, conn *kcp.UDPSession, privkey []byte) er
 			}
 			return fmt.Errorf("failed to accept stream: %w", err)
 		}
-		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
-		go func() {
+		conv := conn.GetConv()
+		slog.Info("begin stream", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()))
+		go func(stream *smux.Stream, conv uint32) {
 			streamCtx, streamSpan := otel.Tracer(tracerName).Start(sessCtx, "dnstt.server.stream",
 				trace.WithAttributes(
-					attribute.String("conv_id", fmt.Sprintf("%08x", conn.GetConv())),
+					attribute.String("conv_id", fmt.Sprintf("%08x", conv)),
 					attribute.Int("stream_id", int(stream.ID())),
 				))
 			defer streamSpan.End()
-			serverStreams.Add(streamCtx, 1, metric.WithAttributes(
-				attribute.String("conv_id", fmt.Sprintf("%08x", conn.GetConv())),
-			))
+			serverStreams.Add(streamCtx, 1)
 			defer func() {
-				slog.Info("end stream", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()))
+				slog.Info("end stream", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()))
 				stream.Close()
 			}()
-			err := handleStream(streamCtx, stream, conn.GetConv())
+			err := handleStream(streamCtx, stream, conv)
 			if err != nil {
 				streamSpan.RecordError(err)
 				streamSpan.SetStatus(codes.Error, err.Error())
-				slog.Error("handleStream failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
+				slog.Error("handleStream failed", slog.String("conv", fmt.Sprintf("%08x", conv)), slog.Any("stream_id", stream.ID()), slog.Any("err", err))
 			}
-		}()
+		}(stream, conv)
 	}
 }
 
@@ -469,7 +469,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
 		}
-		go func() {
+		go func(conn *kcp.UDPSession) {
 			defer func() {
 				slog.Info("end session", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())))
 				conn.Close()
@@ -478,7 +478,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				slog.Error("acceptStreams failed", slog.String("conv", fmt.Sprintf("%08x", conn.GetConv())), slog.Any("err", err))
 			}
-		}()
+		}(conn)
 	}
 }
 
@@ -1084,7 +1084,13 @@ Example:
 			slog.Error("failed to initialize OpenTelemetry", slog.Any("err", err))
 			os.Exit(1)
 		}
-		defer otelShutdown(context.Background())
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := otelShutdown(ctx); err != nil {
+				slog.Error("OTel shutdown error", slog.Any("err", err))
+			}
+		}()
 	}
 	initServerTelemetry()
 

@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 	"www.bamsoftware.com/git/dnstt.git/dns"
 	"www.bamsoftware.com/git/dnstt.git/noise"
@@ -325,14 +326,20 @@ type retryRoundTripper struct {
 	resetSession func() // closes the current session; next retry creates a fresh one
 }
 
-func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+func (r *retryRoundTripper) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	ctx, span := otel.Tracer(tracerName).Start(req.Context(), "dnstt.request",
 		trace.WithAttributes(
-			attribute.String("http.request.method", req.Method),
-			attribute.String("url.full", req.URL.String()),
+			semconv.HTTPRequestMethodKey.String(req.Method),
+			semconv.URLFullKey.String(req.URL.String()),
 		),
 	)
 	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
 	req = req.WithContext(ctx)
 
 	var lastErr error
@@ -364,16 +371,16 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 
 			r.inner.CloseIdleConnections()
 			if req.GetBody != nil {
-				body, err := req.GetBody()
-				if err != nil {
-					return nil, fmt.Errorf("retrying request body: %w", err)
+				body, bodyErr := req.GetBody()
+				if bodyErr != nil {
+					return nil, fmt.Errorf("retrying request body: %w", bodyErr)
 				}
 				req.Body = body
 			}
 		}
-		resp, err := r.inner.RoundTrip(req)
+		resp, err = r.inner.RoundTrip(req)
 		if err == nil {
-			span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+			span.SetAttributes(semconv.HTTPResponseStatusCodeKey.Int(resp.StatusCode))
 			if resp.StatusCode >= 400 {
 				span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", resp.StatusCode))
 			}
@@ -398,8 +405,6 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 		lastErr = err
 	}
-	span.RecordError(lastErr)
-	span.SetStatus(codes.Error, lastErr.Error())
 	return nil, lastErr
 }
 
