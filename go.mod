@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.2
 
 require (
-	github.com/refraction-networking/utls v1.7.0
+	github.com/refraction-networking/utls v1.8.2
 	github.com/stretchr/testify v1.10.0
 	github.com/xtaci/kcp-go/v5 v5.6.20
 	github.com/xtaci/smux v1.5.34
@@ -15,7 +15,6 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/cloudflare/circl v1.5.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/flynn/noise v1.0.0 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
