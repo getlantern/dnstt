@@ -120,10 +120,12 @@ var (
 const tracerName = "github.com/getlantern/dnstt/server"
 
 var (
-	serverSessions      metric.Int64Counter
-	serverStreams       metric.Int64Counter
-	serverRequests      metric.Int64Counter
-	serverRequestErrors metric.Int64Counter
+	serverSessions        metric.Int64Counter
+	serverStreams         metric.Int64Counter
+	serverRequests        metric.Int64Counter
+	serverRequestErrors   metric.Int64Counter
+	serverBytesUpstream   metric.Int64Counter
+	serverBytesDownstream metric.Int64Counter
 )
 
 func initServerTelemetry() {
@@ -140,6 +142,16 @@ func initServerTelemetry() {
 	}
 	if serverRequestErrors, err = meter.Int64Counter("dnstt.server.requests.errors"); err != nil {
 		slog.Warn("failed to create request errors metric", slog.Any("err", err))
+	}
+	if serverBytesUpstream, err = meter.Int64Counter("dnstt.server.bytes.upstream",
+		metric.WithUnit("By"),
+		metric.WithDescription("Total bytes forwarded from clients to upstream targets")); err != nil {
+		slog.Warn("failed to create bytes upstream metric", slog.Any("err", err))
+	}
+	if serverBytesDownstream, err = meter.Int64Counter("dnstt.server.bytes.downstream",
+		metric.WithUnit("By"),
+		metric.WithDescription("Total bytes returned from upstream targets to clients")); err != nil {
+		slog.Warn("failed to create bytes downstream metric", slog.Any("err", err))
 	}
 }
 
@@ -326,7 +338,7 @@ func handleStream(ctx context.Context, stream *smux.Stream, conv uint32) error {
 	// Clear the stream deadline before piping: the request phase is done, so
 	// pipeData can run for as long as the upstream connection is alive.
 	stream.SetDeadline(time.Time{})
-	pipeData(stream, br, targetConn)
+	pipeData(ctx, stream, br, targetConn)
 	return nil
 }
 
@@ -339,19 +351,25 @@ func handleStream(ctx context.Context, stream *smux.Stream, conv uint32) error {
 // bufio.Reader implements io.WriterTo, and WriteTo unconditionally calls
 // targetConn.Write(empty) before filling its buffer — a 0-byte write that
 // blocks forever on net.Pipe connections and stalls in production.
-func pipeData(stream io.ReadWriteCloser, br *bufio.Reader, targetConn io.ReadWriteCloser) {
+func pipeData(ctx context.Context, stream io.ReadWriteCloser, br *bufio.Reader, targetConn io.ReadWriteCloser) {
+	var downstream int64
 	done := make(chan struct{})
 	go func() {
-		io.Copy(stream, targetConn)
+		downstream, _ = io.Copy(stream, targetConn)
 		stream.Close()
 		close(done)
 	}()
+	var upstream int64
 	if n := br.Buffered(); n > 0 {
-		io.CopyN(targetConn, br, int64(n)) //nolint:errcheck
+		copied, _ := io.CopyN(targetConn, br, int64(n)) //nolint:errcheck
+		upstream += copied
 	}
-	io.Copy(targetConn, stream)
+	n, _ := io.Copy(targetConn, stream)
+	upstream += n
 	targetConn.Close()
 	<-done // Wait for the stream to close.
+	serverBytesUpstream.Add(ctx, upstream)
+	serverBytesDownstream.Add(ctx, downstream)
 }
 
 // rollingDeadlineRW wraps a kcp.UDPSession and resets read/write deadlines on
