@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"runtime"
 	"testing"
@@ -10,6 +11,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMain(m *testing.M) {
+	initServerTelemetry()
+	m.Run()
+}
 
 // TestPipeDataExitsOnStreamClose verifies pipeData goroutines exit when the
 // smux stream side closes — the normal client-disconnect path.
@@ -20,7 +26,7 @@ func TestPipeDataExitsOnStreamClose(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pipeData(stream, bufio.NewReader(stream), targetConn)
+		pipeData(context.Background(), stream, bufio.NewReader(stream), targetConn)
 		close(done)
 	}()
 
@@ -42,7 +48,7 @@ func TestPipeDataExitsOnTargetConnClose(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pipeData(stream, bufio.NewReader(stream), targetConn)
+		pipeData(context.Background(), stream, bufio.NewReader(stream), targetConn)
 		close(done)
 	}()
 
@@ -93,7 +99,7 @@ func TestPipeDataExitsOnHungTarget(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pipeData(stream, bufio.NewReader(stream), targetConn)
+		pipeData(context.Background(), stream, bufio.NewReader(stream), targetConn)
 		close(done)
 	}()
 
@@ -115,7 +121,7 @@ func TestPipeDataNoGoroutineLeak(t *testing.T) {
 		stream, streamPeer := net.Pipe()
 		targetConn, targetPeer := net.Pipe()
 
-		go pipeData(stream, bufio.NewReader(stream), targetConn)
+		go pipeData(context.Background(), stream, bufio.NewReader(stream), targetConn)
 
 		// Close both remote ends so pipeData drains immediately.
 		streamPeer.Close()
