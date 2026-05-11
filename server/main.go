@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
@@ -1097,6 +1098,11 @@ Example:
 	})))
 
 	if otelEndpoint != "" {
+		u, err := url.Parse(otelEndpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			fmt.Fprintf(os.Stderr, "invalid -otel-endpoint %q: must be a full URL starting with http:// or https://\n", otelEndpoint)
+			os.Exit(1)
+		}
 		otelShutdown, err := initOTel(context.Background(), otelEndpoint, otelHeaders)
 		if err != nil {
 			slog.Error("failed to initialize OpenTelemetry", slog.Any("err", err))
