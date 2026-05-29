@@ -56,6 +56,7 @@ type dnstt struct {
 	clientHelloID *utls.ClientHelloID
 	transport     transport
 	mtu           int
+	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	sess       *smux.Session
 	sessAccess sync.Mutex
@@ -98,7 +99,7 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 	}
 
 	slog.Info("creating new session", "transport", dnstt.transport)
-	pconn, err := dnstt.transport.dial(dnstt.clientHelloID)
+	pconn, err := dnstt.transport.dial(dnstt.clientHelloID, dnstt.dialContext)
 	if err != nil {
 		slog.Error("dial", "error", err, "transport", dnstt.transport)
 		return nil, fmt.Errorf("dial: %w", err)
@@ -464,6 +465,16 @@ func WithDoT(resolverAddr string) Option {
 	}
 }
 
+// WithDialer sets a custom dial function for all outbound TCP connections made
+// by the DoH or DoT resolver. Use this to bypass a VPN or proxy when DNSTT
+// is employed as a last-resort transport that must work without the tunnel.
+func WithDialer(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
+	return func(d *dnstt) error {
+		d.dialContext = dialContext
+		return nil
+	}
+}
+
 // WithTunnelDomain sets the base domain name used for the DNS tunnel.
 //
 // This should match the subdomain delegated to the tunnel server, as
@@ -535,7 +546,8 @@ func WithUTLSClientHelloID(hello *utls.ClientHelloID) Option {
 // transport defines an interface for dialing a DNS-based connection.
 type transport interface {
 	// dial establishes a DNS-based connection using the provided ClientHelloID.
-	dial(hello *utls.ClientHelloID) (net.PacketConn, error)
+	// dc is an optional dial function; nil falls back to the default net.Dialer.
+	dial(hello *utls.ClientHelloID, dc func(ctx context.Context, network, addr string) (net.Conn, error)) (net.PacketConn, error)
 	// String returns a string representation of the transport.
 	String() string
 }
@@ -545,7 +557,7 @@ type dohDialer struct {
 	url string
 }
 
-func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
+func (d *dohDialer) dial(hello *utls.ClientHelloID, dc func(ctx context.Context, network, addr string) (net.Conn, error)) (net.PacketConn, error) {
 	var rt http.RoundTripper
 	if hello == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -555,9 +567,12 @@ func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
 		// which do not take a proxy from the
 		// environment.
 		transport.Proxy = nil
+		if dc != nil {
+			transport.DialContext = dc
+		}
 		rt = transport
 	} else {
-		rt = NewUTLSRoundTripper(nil, hello)
+		rt = NewUTLSRoundTripperWithDialer(nil, hello, dc)
 	}
 	return NewHTTPPacketConn(rt, d.url, 32)
 }
@@ -569,13 +584,32 @@ type dotDialer struct {
 	addr string
 }
 
-func (d *dotDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
+func (d *dotDialer) dial(hello *utls.ClientHelloID, dc func(ctx context.Context, network, addr string) (net.Conn, error)) (net.PacketConn, error) {
 	var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	if hello == nil {
-		dialTLSContext = (&tls.Dialer{}).DialContext
+		if dc != nil {
+			dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				rawConn, err := dc(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(rawConn, &tls.Config{ServerName: host})
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					rawConn.Close()
+					return nil, err
+				}
+				return tlsConn, nil
+			}
+		} else {
+			dialTLSContext = (&tls.Dialer{}).DialContext
+		}
 	} else {
 		dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return utlsDialContext(ctx, network, addr, nil, hello)
+			return utlsDialContext(ctx, network, addr, nil, hello, dc)
 		}
 	}
 	return NewTLSPacketConn(d.addr, dialTLSContext)
