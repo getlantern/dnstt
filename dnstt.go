@@ -174,6 +174,7 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	//   nc=1       → disable congestion window (window limited only by
 	//                the static send/recv window sizes set below)
 	conn.SetNoDelay(1, 5, 1, 1)
+	conn.SetACKNoDelay(true)
 	conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 	if !conn.SetMtu(d.mtu) {
 		return fmt.Errorf("setting MTU to %d", d.mtu)

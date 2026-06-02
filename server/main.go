@@ -482,6 +482,9 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 		//   resend=1   → fast-retransmit after 1 duplicate ACK
 		//   nc=1       → disable congestion window
 		conn.SetNoDelay(1, 5, 1, 1)
+		// Send ACKs immediately rather than batching them with the next
+		// 5 ms tick; this lets the remote side open its send window sooner.
+		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 		if rc := conn.SetMtu(mtu); !rc {
 			panic(rc)
