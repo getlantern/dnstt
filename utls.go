@@ -73,12 +73,11 @@ func utlsLookup(label string) *utls.ClientHelloID {
 // handshake with the provided ClientHelloID, and returns the resulting TLS
 // connection.
 func utlsDialContext(ctx context.Context, network, addr string, config *utls.Config, id *utls.ClientHelloID, dialFn func(context.Context, string, string) (net.Conn, error)) (*utls.UConn, error) {
-	// Set the SNI from addr, if not already set.
 	if config == nil {
 		config = &utls.Config{}
 	}
+	config = config.Clone()
 	if config.ServerName == "" {
-		config = config.Clone()
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
@@ -93,7 +92,7 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 		return nil, err
 	}
 	uconn := utls.UClient(conn, config, *id)
-	// Must call before filtering curves: buildHandshakeState applies the
+	// Must call before filtering curves: BuildHandshakeState applies the
 	// browser preset and overwrites CurvePreferences with the spec values.
 	if err := uconn.BuildHandshakeState(); err != nil {
 		uconn.Close()
@@ -105,9 +104,6 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 	// curves (X25519Kyber768Draft00 / 0x6399) that are not valid ECDHE
 	// curves. Strip them so makeClientHello does not fail with
 	// "tls: CurvePreferences includes unsupported curve".
-	//
-	// config shares the same *Config as uconn.Conn.config, so modifying
-	// curvePreferences here also takes effect for makeClientHello later.
 	if len(config.CurvePreferences) > 0 {
 		filtered := make([]utls.CurveID, 0, len(config.CurvePreferences))
 		for _, c := range config.CurvePreferences {
