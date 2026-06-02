@@ -75,8 +75,8 @@ func TestRoundTripperE2E(t *testing.T) {
 	rt, err := dt.NewRoundTripper(context.Background(), "")
 	require.NoError(t, err)
 
-	url := "https://mock.httpstatus.io/chain?count=2"
-	// url := "https://detectportal.firefox.com/success.txt"
+	// url := "https://mock.httpstatus.io/chain?count=2"
+	url := "https://detectportal.firefox.com/success.txt"
 	req, err := http.NewRequest("GET", url, nil)
 	require.NoError(t, err)
 

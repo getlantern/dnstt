@@ -34,6 +34,14 @@ const dialTimeout = 30 * time.Second
 //
 // https://tools.ietf.org/html/rfc7858
 type TLSPacketConn struct {
+	// closed is closed by Close so sendLoop returns and the redial loop stops
+	// reconnecting. conn holds the live TLS connection so Close can close it,
+	// unblocking recvLoop's blocking read.
+	closed    chan struct{}
+	closeOnce sync.Once
+	connMu    sync.Mutex
+	conn      net.Conn
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -59,6 +67,8 @@ func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, netw
 		return nil, err
 	}
 	c := &TLSPacketConn{
+		closed:          make(chan struct{}),
+		conn:            conn,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
 	}
 	go func() {
@@ -83,15 +93,39 @@ func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, netw
 			wg.Wait()
 			conn.Close()
 
+			select {
+			case <-c.closed:
+				return
+			default:
+			}
+
 			// Whenever the TLS connection dies, redial a new one.
 			conn, err = dial()
 			if err != nil {
 				log.Printf("dial tls: %v", err)
 				break
 			}
+			c.connMu.Lock()
+			c.conn = conn
+			c.connMu.Unlock()
 		}
 	}()
 	return c, nil
+}
+
+// Close stops the send loop and redial loop and closes the live TLS connection,
+// unblocking recvLoop. Without it the redial loop reconnects forever after the
+// session ends.
+func (c *TLSPacketConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.connMu.Lock()
+		if c.conn != nil {
+			c.conn.Close()
+		}
+		c.connMu.Unlock()
+	})
+	return c.QueuePacketConn.Close()
 }
 
 // recvLoop reads length-prefixed messages from conn and passes them to the
@@ -120,7 +154,15 @@ func (c *TLSPacketConn) recvLoop(conn net.Conn) error {
 // length-prefixed, to conn.
 func (c *TLSPacketConn) sendLoop(conn net.Conn) error {
 	bw := bufio.NewWriter(conn)
-	for p := range c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}) {
+	outgoing := c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{})
+	for {
+		var p []byte
+		select {
+		case <-c.closed:
+			return nil
+		case p = <-outgoing:
+		}
+
 		length := uint16(len(p))
 		if int(length) != len(p) {
 			panic(len(p))
@@ -138,5 +180,4 @@ func (c *TLSPacketConn) sendLoop(conn net.Conn) error {
 			return err
 		}
 	}
-	return nil
 }

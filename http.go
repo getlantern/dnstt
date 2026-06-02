@@ -54,6 +54,12 @@ type HTTPPacketConn struct {
 	notBefore     time.Time
 	notBeforeLock sync.RWMutex
 
+	// The outgoing queue is never closed, so without this signal a sendLoop
+	// blocked on it would never return; all numSenders goroutines would leak
+	// after the session ends.
+	closed    chan struct{}
+	closeOnce sync.Once
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// sendLoop, via send, removes messages from the outgoing queue that
 	// were placed there by WriteTo, and inserts messages into the incoming
@@ -73,6 +79,7 @@ func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (
 			Timeout:   1 * time.Minute,
 		},
 		urlString:       urlString,
+		closed:          make(chan struct{}),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
 	}
 	for i := 0; i < numSenders; i++ {
@@ -149,7 +156,15 @@ func (c *HTTPPacketConn) send(p []byte) error {
 // sendLoop loops over the contents of the outgoing queue and passes them to
 // send. It drops packets while c.notBefore is in the future.
 func (c *HTTPPacketConn) sendLoop() {
-	for p := range c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}) {
+	outgoing := c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{})
+	for {
+		var p []byte
+		select {
+		case <-c.closed:
+			return
+		case p = <-outgoing:
+		}
+
 		// Stop sending while we are rate-limiting ourselves (as a
 		// result of a Retry-After response header, for example).
 		c.notBeforeLock.RLock()
@@ -165,6 +180,11 @@ func (c *HTTPPacketConn) sendLoop() {
 			log.Printf("sendLoop: %v", err)
 		}
 	}
+}
+
+func (c *HTTPPacketConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.QueuePacketConn.Close()
 }
 
 // parseRetryAfter parses the value of a Retry-After header as an absolute

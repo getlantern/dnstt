@@ -93,13 +93,43 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 		return nil, err
 	}
 	uconn := utls.UClient(conn, config, *id)
+	// Must call before filtering curves: buildHandshakeState applies the
+	// browser preset and overwrites CurvePreferences with the spec values.
+	if err := uconn.BuildHandshakeState(); err != nil {
+		uconn.Close()
+		return nil, fmt.Errorf("build handshake state: %w", err)
+	}
+	// Go 1.26's curveForCurveID only supports X25519, P256, P384, P521,
+	// and X25519MLKEM768 (handled specially outside curveForCurveID).
+	// Some uTLS presets include FFDHE group IDs (256, 257) and draft PQ
+	// curves (X25519Kyber768Draft00 / 0x6399) that are not valid ECDHE
+	// curves. Strip them so makeClientHello does not fail with
+	// "tls: CurvePreferences includes unsupported curve".
+	//
+	// config shares the same *Config as uconn.Conn.config, so modifying
+	// curvePreferences here also takes effect for makeClientHello later.
+	if len(config.CurvePreferences) > 0 {
+		filtered := make([]utls.CurveID, 0, len(config.CurvePreferences))
+		for _, c := range config.CurvePreferences {
+			switch c {
+			case utls.X25519, utls.CurveP256, utls.CurveP384, utls.CurveP521,
+				utls.X25519MLKEM768:
+				filtered = append(filtered, c)
+			}
+		}
+		config.CurvePreferences = filtered
+	}
+	uconn.HandshakeState.Hello.SupportedCurves = config.CurvePreferences
 	// We must call Handshake before returning, or else the UConn may not
 	// actually use the selected ClientHelloID. It depends on whether a Read
 	// or a Write happens first. If a Read happens first, the connection
 	// will use the normal crypto/tls fingerprint. If a Write happens first,
 	// it will use the selected fingerprint as expected.
 	// https://github.com/refraction-networking/utls/issues/75
-	err = uconn.Handshake()
+	//
+	// Use Conn.Handshake() to bypass UConn.handshakeContext() which would
+	// call BuildHandshakeState again and re-apply the spec's curves.
+	err = uconn.Conn.Handshake()
 	if err != nil {
 		uconn.Close()
 		return nil, err
