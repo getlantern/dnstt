@@ -105,6 +105,12 @@ func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, netw
 				log.Printf("dial tls: %v", err)
 				break
 			}
+			select {
+			case <-c.closed:
+				conn.Close()
+				return
+			default:
+			}
 			c.connMu.Lock()
 			c.conn = conn
 			c.connMu.Unlock()

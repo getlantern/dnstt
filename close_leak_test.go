@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
 func waitGoroutines(t *testing.T, want int) {
@@ -56,7 +57,7 @@ func TestDNSTTCloseStopsLeakOnFailingResolver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	d.pconn = NewDNSPacketConn(pconn, nil, d.domain)
+	d.pconn = NewDNSPacketConn(pconn, turbotunnel.DummyAddr{}, d.domain)
 
 	rt, err := d.NewRoundTripper(context.Background(), "")
 	if err != nil {
