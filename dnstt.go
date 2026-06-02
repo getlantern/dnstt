@@ -120,10 +120,18 @@ func (d *dnstt) Close() error {
 		d.sessCancel()
 		d.sessCancel = nil
 	}
+	var sessErr error
 	if d.sess != nil {
-		return d.sess.Close()
+		sessErr = d.sess.Close()
 	}
-	return nil
+	// Closing the packet conn stops the DNS poll loops and the resolver's
+	// sender goroutines; closing only the session leaks them.
+	if d.pconn != nil {
+		if err := d.pconn.Close(); err != nil && sessErr == nil {
+			sessErr = err
+		}
+	}
+	return sessErr
 }
 
 func (d *dnstt) isClosed() bool {
@@ -161,15 +169,12 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	conn.SetStreamMode(true)
 	// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
 	//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
-	//   interval=10 → flush/retransmit tick every 10 ms
-	//   resend=2   → fast-retransmit after 2 duplicate ACKs
+	//   interval=5 → flush/retransmit tick every 5 ms (vs default 10 ms)
+	//   resend=1   → fast-retransmit after 1 duplicate ACK
 	//   nc=1       → disable congestion window (window limited only by
 	//                the static send/recv window sizes set below)
-	conn.SetNoDelay(1, 10, 2, 1)
-	// Send ACKs immediately rather than batching them with the next
-	// 10 ms tick; this lets the remote side open its send window sooner.
-	conn.SetACKNoDelay(true)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	conn.SetNoDelay(1, 5, 1, 1)
+	conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 	if !conn.SetMtu(d.mtu) {
 		return fmt.Errorf("setting MTU to %d", d.mtu)
 	}
@@ -398,10 +403,13 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (resp *http.Response, e
 		if !isTunnelEOF(err) {
 			return nil, err
 		}
-		// If the stream timed out, the KCP session may be degraded.
-		// Reset it so the next retry gets a fresh session with a clean state.
-		if isNetTimeout(err) && r.resetSession != nil {
-			slog.Debug("stream timeout — resetting KCP session before retry", "attempt", attempt)
+		// A plain EOF often means the server closed the stream because the
+		// TLS handshake timed out.  The KCP/Noise session may be degraded,
+		// so reset it so the next retry gets a fresh session.  A net
+		// time-out (e.g. context deadline from a slow DNS exchange) also
+		// resets the session for the same reason.
+		if r.resetSession != nil {
+			slog.Debug("resetting KCP session before retry", "attempt", attempt, "reason", err)
 			r.resetSession()
 		}
 		lastErr = err
