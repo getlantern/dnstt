@@ -1,11 +1,6 @@
 // Author: David Fifield
 // david@bamsoftware.com
 // https://www.bamsoftware.com/software/dnstt/
-//
-// package dnstt-client
-// ///////////////////////////////////////////////////////////
-// /////    This file is unmodified from the original    /////
-// ///////////////////////////////////////////////////////////
 package dnstt
 
 // Support code for TLS camouflage using uTLS.

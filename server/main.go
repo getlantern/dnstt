@@ -478,12 +478,12 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int) error {
 		conn.SetStreamMode(true)
 		// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
 		//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
-		//   interval=5 → flush/retransmit tick every 5 ms (vs default 10 ms)
-		//   resend=1   → fast-retransmit after 1 duplicate ACK
-		//   nc=1       → disable congestion window
-		conn.SetNoDelay(1, 5, 1, 1)
+		//   interval=10 → flush/retransmit tick every 10 ms
+		//   resend=1    → fast-retransmit after 1 duplicate ACK
+		//   nc=1        → disable congestion window
+		conn.SetNoDelay(1, 10, 1, 1)
 		// Send ACKs immediately rather than batching them with the next
-		// 5 ms tick; this lets the remote side open its send window sooner.
+		// tick; this lets the remote side open its send window sooner.
 		conn.SetACKNoDelay(true)
 		conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 		if rc := conn.SetMtu(mtu); !rc {

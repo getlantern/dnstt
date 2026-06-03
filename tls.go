@@ -1,11 +1,6 @@
 // Author: David Fifield
 // david@bamsoftware.com
 // https://www.bamsoftware.com/software/dnstt/
-//
-// package dnstt-client
-// ///////////////////////////////////////////////////////////
-// /////    This file is unmodified from the original    /////
-// ///////////////////////////////////////////////////////////
 package dnstt
 
 import (
@@ -105,13 +100,14 @@ func NewTLSPacketConn(addr string, dialTLSContext func(ctx context.Context, netw
 				log.Printf("dial tls: %v", err)
 				break
 			}
+			c.connMu.Lock()
 			select {
 			case <-c.closed:
+				c.connMu.Unlock()
 				conn.Close()
 				return
 			default:
 			}
-			c.connMu.Lock()
 			c.conn = conn
 			c.connMu.Unlock()
 		}

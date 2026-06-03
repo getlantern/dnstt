@@ -169,11 +169,11 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	conn.SetStreamMode(true)
 	// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
 	//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
-	//   interval=5 → flush/retransmit tick every 5 ms (vs default 10 ms)
-	//   resend=1   → fast-retransmit after 1 duplicate ACK
-	//   nc=1       → disable congestion window (window limited only by
-	//                the static send/recv window sizes set below)
-	conn.SetNoDelay(1, 5, 1, 1)
+	//   interval=10 → flush/retransmit tick every 10 ms
+	//   resend=1    → fast-retransmit after 1 duplicate ACK
+	//   nc=1        → disable congestion window (window limited only by
+	//                 the static send/recv window sizes set below)
+	conn.SetNoDelay(1, 10, 1, 1)
 	conn.SetACKNoDelay(true)
 	conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 	if !conn.SetMtu(d.mtu) {
