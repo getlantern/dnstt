@@ -1,11 +1,6 @@
 // Author: David Fifield
 // david@bamsoftware.com
 // https://www.bamsoftware.com/software/dnstt/
-//
-// package dnstt-client
-// ///////////////////////////////////////////////////////////
-// /////    This file is unmodified from the original    /////
-// ///////////////////////////////////////////////////////////
 package dnstt
 
 import (
@@ -17,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -70,6 +66,13 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+
+	// Retained so Close can shut down the transport, stopping its senders.
+	transport net.PacketConn
+	// Without this signal sendLoop polls forever after the session is gone.
+	closed    chan struct{}
+	closeOnce sync.Once
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -87,6 +90,8 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		clientID:        clientID,
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
+		transport:       transport,
+		closed:          make(chan struct{}),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
@@ -360,6 +365,12 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 	pollDelay := initPollDelay
 	pollTimer := time.NewTimer(pollDelay)
 	for {
+		select {
+		case <-c.closed:
+			return nil
+		default:
+		}
+
 		var p []byte
 		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
 		pollTimerExpired := false
@@ -373,6 +384,8 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			case <-c.pollChan:
 			case <-pollTimer.C:
 				pollTimerExpired = true
+			case <-c.closed:
+				return nil
 			}
 		}
 
@@ -414,7 +427,16 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 	}
 }
 
+// Close shuts down the send loop and the underlying transport, then closes the
+// embedded queue. Closing the transport unblocks recvLoop's ReadFrom so it
+// returns; without this the loops and the transport's sender goroutines run
+// forever after the session ends.
 func (c *DNSPacketConn) Close() error {
-	// Close the underlying transport.
-	return nil
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		if c.transport != nil {
+			c.transport.Close()
+		}
+	})
+	return c.QueuePacketConn.Close()
 }

@@ -1,11 +1,6 @@
 // Author: David Fifield
 // david@bamsoftware.com
 // https://www.bamsoftware.com/software/dnstt/
-//
-// package dnstt-client
-// ///////////////////////////////////////////////////////////
-// /////    This file is unmodified from the original    /////
-// ///////////////////////////////////////////////////////////
 package dnstt
 
 // Support code for TLS camouflage using uTLS.
@@ -72,32 +67,60 @@ func utlsLookup(label string) *utls.ClientHelloID {
 // utlsDialContext connects to the given network address and initiates a TLS
 // handshake with the provided ClientHelloID, and returns the resulting TLS
 // connection.
-func utlsDialContext(ctx context.Context, network, addr string, config *utls.Config, id *utls.ClientHelloID) (*utls.UConn, error) {
-	// Set the SNI from addr, if not already set.
+func utlsDialContext(ctx context.Context, network, addr string, config *utls.Config, id *utls.ClientHelloID, dialFn func(context.Context, string, string) (net.Conn, error)) (*utls.UConn, error) {
 	if config == nil {
 		config = &utls.Config{}
 	}
+	config = config.Clone()
 	if config.ServerName == "" {
-		config = config.Clone()
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
 		}
 		config.ServerName = host
 	}
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, network, addr)
+	if dialFn == nil {
+		dialFn = (&net.Dialer{}).DialContext
+	}
+	conn, err := dialFn(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
 	uconn := utls.UClient(conn, config, *id)
+	// Must call before filtering curves: BuildHandshakeState applies the
+	// browser preset and overwrites CurvePreferences with the spec values.
+	if err := uconn.BuildHandshakeState(); err != nil {
+		uconn.Close()
+		return nil, fmt.Errorf("build handshake state: %w", err)
+	}
+	// Go 1.26's curveForCurveID only supports X25519, P256, P384, P521,
+	// and X25519MLKEM768 (handled specially outside curveForCurveID).
+	// Some uTLS presets include FFDHE group IDs (256, 257) and draft PQ
+	// curves (X25519Kyber768Draft00 / 0x6399) that are not valid ECDHE
+	// curves. Strip them so makeClientHello does not fail with
+	// "tls: CurvePreferences includes unsupported curve".
+	if len(config.CurvePreferences) > 0 {
+		filtered := make([]utls.CurveID, 0, len(config.CurvePreferences))
+		for _, c := range config.CurvePreferences {
+			switch c {
+			case utls.X25519, utls.CurveP256, utls.CurveP384, utls.CurveP521,
+				utls.X25519MLKEM768:
+				filtered = append(filtered, c)
+			}
+		}
+		config.CurvePreferences = filtered
+	}
+	uconn.HandshakeState.Hello.SupportedCurves = config.CurvePreferences
 	// We must call Handshake before returning, or else the UConn may not
 	// actually use the selected ClientHelloID. It depends on whether a Read
 	// or a Write happens first. If a Read happens first, the connection
 	// will use the normal crypto/tls fingerprint. If a Write happens first,
 	// it will use the selected fingerprint as expected.
 	// https://github.com/refraction-networking/utls/issues/75
-	err = uconn.Handshake()
+	//
+	// Use Conn.Handshake() to bypass UConn.handshakeContext() which would
+	// call BuildHandshakeState again and re-apply the spec's curves.
+	err = uconn.Conn.Handshake()
 	if err != nil {
 		uconn.Close()
 		return nil, err
@@ -146,6 +169,7 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 type utlsRoundTripper struct {
 	clientHelloID *utls.ClientHelloID
 	config        *utls.Config
+	dialFn        func(context.Context, string, string) (net.Conn, error)
 	innerLock     sync.Mutex
 	inner         http.RoundTripper
 }
@@ -157,6 +181,16 @@ func NewUTLSRoundTripper(config *utls.Config, id *utls.ClientHelloID) *utlsRound
 		clientHelloID: id,
 		config:        config,
 		// inner will be set in the first call to RoundTrip.
+	}
+}
+
+// NewUTLSRoundTripperWithDialer creates a utlsRoundTripper that uses dialFn for
+// all outbound TCP connections. Pass nil to use the default net.Dialer.
+func NewUTLSRoundTripperWithDialer(config *utls.Config, id *utls.ClientHelloID, dialFn func(context.Context, string, string) (net.Conn, error)) *utlsRoundTripper {
+	return &utlsRoundTripper{
+		clientHelloID: id,
+		config:        config,
+		dialFn:        dialFn,
 	}
 }
 
@@ -175,7 +209,7 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	if rt.inner == nil {
 		// On the first call, make an http.Transport or http2.Transport
 		// as appropriate.
-		rt.inner, err = makeRoundTripper(req, rt.config, rt.clientHelloID)
+		rt.inner, err = makeRoundTripper(req, rt.config, rt.clientHelloID, rt.dialFn)
 	}
 	rt.innerLock.Unlock()
 	if err != nil {
@@ -191,13 +225,13 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 // http2.Transport, depending on the negotated ALPN. The Transport is set up to
 // make future TLS connections using the same TLS configuration and
 // ClientHelloID.
-func makeRoundTripper(req *http.Request, config *utls.Config, id *utls.ClientHelloID) (http.RoundTripper, error) {
+func makeRoundTripper(req *http.Request, config *utls.Config, id *utls.ClientHelloID, dialFn func(context.Context, string, string) (net.Conn, error)) (http.RoundTripper, error) {
 	addr, err := addrForDial(req.URL)
 	if err != nil {
 		return nil, err
 	}
 
-	bootstrapConn, err := utlsDialContext(req.Context(), "tcp", addr, config, id)
+	bootstrapConn, err := utlsDialContext(req.Context(), "tcp", addr, config, id, dialFn)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +255,7 @@ func makeRoundTripper(req *http.Request, config *utls.Config, id *utls.ClientHel
 		}
 
 		// Later dials make a new connection.
-		uconn, err := utlsDialContext(ctx, "tcp", addr, config, id)
+		uconn, err := utlsDialContext(ctx, "tcp", addr, config, id, dialFn)
 		if err != nil {
 			return nil, err
 		}

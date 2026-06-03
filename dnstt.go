@@ -56,6 +56,7 @@ type dnstt struct {
 	clientHelloID *utls.ClientHelloID
 	transport     transport
 	mtu           int
+	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	sess       *smux.Session
 	sessAccess sync.Mutex
@@ -98,7 +99,7 @@ func NewDNSTT(options ...Option) (DNSTT, error) {
 	}
 
 	slog.Info("creating new session", "transport", dnstt.transport)
-	pconn, err := dnstt.transport.dial(dnstt.clientHelloID)
+	pconn, err := dnstt.transport.dial(dnstt.clientHelloID, dnstt.dialContext)
 	if err != nil {
 		slog.Error("dial", "error", err, "transport", dnstt.transport)
 		return nil, fmt.Errorf("dial: %w", err)
@@ -119,10 +120,18 @@ func (d *dnstt) Close() error {
 		d.sessCancel()
 		d.sessCancel = nil
 	}
+	var sessErr error
 	if d.sess != nil {
-		return d.sess.Close()
+		sessErr = d.sess.Close()
 	}
-	return nil
+	// Closing the packet conn stops the DNS poll loops and the resolver's
+	// sender goroutines; closing only the session leaks them.
+	if d.pconn != nil {
+		if err := d.pconn.Close(); err != nil && sessErr == nil {
+			sessErr = err
+		}
+	}
+	return sessErr
 }
 
 func (d *dnstt) isClosed() bool {
@@ -161,14 +170,12 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
 	//   nodelay=1  → minimum RTO 30 ms (vs 100 ms default)
 	//   interval=10 → flush/retransmit tick every 10 ms
-	//   resend=2   → fast-retransmit after 2 duplicate ACKs
-	//   nc=1       → disable congestion window (window limited only by
-	//                the static send/recv window sizes set below)
-	conn.SetNoDelay(1, 10, 2, 1)
-	// Send ACKs immediately rather than batching them with the next
-	// 10 ms tick; this lets the remote side open its send window sooner.
+	//   resend=1    → fast-retransmit after 1 duplicate ACK
+	//   nc=1        → disable congestion window (window limited only by
+	//                 the static send/recv window sizes set below)
+	conn.SetNoDelay(1, 10, 1, 1)
 	conn.SetACKNoDelay(true)
-	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+	conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 	if !conn.SetMtu(d.mtu) {
 		return fmt.Errorf("setting MTU to %d", d.mtu)
 	}
@@ -397,10 +404,13 @@ func (r *retryRoundTripper) RoundTrip(req *http.Request) (resp *http.Response, e
 		if !isTunnelEOF(err) {
 			return nil, err
 		}
-		// If the stream timed out, the KCP session may be degraded.
-		// Reset it so the next retry gets a fresh session with a clean state.
-		if isNetTimeout(err) && r.resetSession != nil {
-			slog.Debug("stream timeout — resetting KCP session before retry", "attempt", attempt)
+		// A plain EOF often means the server closed the stream because the
+		// TLS handshake timed out.  The KCP/Noise session may be degraded,
+		// so reset it so the next retry gets a fresh session.  A net
+		// time-out (e.g. context deadline from a slow DNS exchange) also
+		// resets the session for the same reason.
+		if r.resetSession != nil {
+			slog.Debug("resetting KCP session before retry", "attempt", attempt, "reason", err)
 			r.resetSession()
 		}
 		lastErr = err
@@ -460,6 +470,16 @@ func WithDoT(resolverAddr string) Option {
 		}
 		slog.Info("using DoT", "addr", resolverAddr)
 		d.transport = &dotDialer{addr: resolverAddr}
+		return nil
+	}
+}
+
+// WithDialer sets a custom dial function for all outbound TCP connections made
+// by the DoH or DoT resolver. Use this to bypass a VPN or proxy when DNSTT
+// is employed as a last-resort transport that must work without the tunnel.
+func WithDialer(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
+	return func(d *dnstt) error {
+		d.dialContext = dialContext
 		return nil
 	}
 }
@@ -535,7 +555,8 @@ func WithUTLSClientHelloID(hello *utls.ClientHelloID) Option {
 // transport defines an interface for dialing a DNS-based connection.
 type transport interface {
 	// dial establishes a DNS-based connection using the provided ClientHelloID.
-	dial(hello *utls.ClientHelloID) (net.PacketConn, error)
+	// dc is an optional dial function; nil falls back to the default net.Dialer.
+	dial(hello *utls.ClientHelloID, dc func(ctx context.Context, network, addr string) (net.Conn, error)) (net.PacketConn, error)
 	// String returns a string representation of the transport.
 	String() string
 }
@@ -545,7 +566,7 @@ type dohDialer struct {
 	url string
 }
 
-func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
+func (d *dohDialer) dial(hello *utls.ClientHelloID, dc func(ctx context.Context, network, addr string) (net.Conn, error)) (net.PacketConn, error) {
 	var rt http.RoundTripper
 	if hello == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -555,9 +576,12 @@ func (d *dohDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
 		// which do not take a proxy from the
 		// environment.
 		transport.Proxy = nil
+		if dc != nil {
+			transport.DialContext = dc
+		}
 		rt = transport
 	} else {
-		rt = NewUTLSRoundTripper(nil, hello)
+		rt = NewUTLSRoundTripperWithDialer(nil, hello, dc)
 	}
 	return NewHTTPPacketConn(rt, d.url, 32)
 }
@@ -569,13 +593,32 @@ type dotDialer struct {
 	addr string
 }
 
-func (d *dotDialer) dial(hello *utls.ClientHelloID) (net.PacketConn, error) {
+func (d *dotDialer) dial(hello *utls.ClientHelloID, dc func(ctx context.Context, network, addr string) (net.Conn, error)) (net.PacketConn, error) {
 	var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	if hello == nil {
-		dialTLSContext = (&tls.Dialer{}).DialContext
+		if dc != nil {
+			dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				rawConn, err := dc(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(rawConn, &tls.Config{ServerName: host})
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					rawConn.Close()
+					return nil, err
+				}
+				return tlsConn, nil
+			}
+		} else {
+			dialTLSContext = (&tls.Dialer{}).DialContext
+		}
 	} else {
 		dialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return utlsDialContext(ctx, network, addr, nil, hello)
+			return utlsDialContext(ctx, network, addr, nil, hello, dc)
 		}
 	}
 	return NewTLSPacketConn(d.addr, dialTLSContext)
