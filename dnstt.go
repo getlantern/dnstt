@@ -37,6 +37,13 @@ const (
 	defaultUTLSDistribution = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
 
 	tracerName = "github.com/getlantern/dnstt"
+
+	// sessionHandshakeTimeout bounds KCP/Noise/smux session establishment when
+	// the caller's context carries no deadline. A reachable resolver whose
+	// tunnel server never answers would otherwise block the handshake read
+	// forever. Kept generous: establishment can take ~20-60 s over DoH at small
+	// MTU.
+	sessionHandshakeTimeout = 2 * time.Minute
 )
 
 // DNSTT defines the interface for a DNS-based tunneling transport.
@@ -138,33 +145,35 @@ func (d *dnstt) isClosed() bool {
 	return d.closed.Load()
 }
 
-func (d *dnstt) maybeCreateSession() (err error) {
+func (d *dnstt) maybeCreateSession(ctx context.Context) error {
+	// Decide under the lock, but release it before the handshake: Close also
+	// needs sessAccess, so holding it across a handshake that never completes
+	// (a reachable resolver whose tunnel is silent) deadlocked Close and leaked
+	// every session loop.
 	d.sessAccess.Lock()
-	defer d.sessAccess.Unlock()
 	if d.sess != nil && !d.sess.IsClosed() {
+		d.sessAccess.Unlock()
 		return nil
 	}
 	if d.sessCancel != nil {
 		d.sessCancel()
 		d.sessCancel = nil
 	}
-	if d.pconn == nil {
+	pconn := d.pconn
+	d.sessAccess.Unlock()
+	if pconn == nil {
 		return errors.New("no packet connection: transport dial may have failed")
+	}
+	if d.isClosed() {
+		return errors.New("dnstt is closed")
 	}
 
 	// Open a KCP conn on the PacketConn.
-	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, d.pconn)
+	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, pconn)
 	if err != nil {
 		return fmt.Errorf("opening KCP conn: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			d.convID = 0
-			conn.Close()
-		}
-	}()
 
-	d.convID = conn.GetConv()
 	// Permit coalescing the payloads of consecutive sends.
 	conn.SetStreamMode(true)
 	// Tune KCP for low-latency interactive use over a high-delay DNS tunnel:
@@ -177,35 +186,62 @@ func (d *dnstt) maybeCreateSession() (err error) {
 	conn.SetACKNoDelay(true)
 	conn.SetWindowSize(turbotunnel.QueueSize, turbotunnel.QueueSize)
 	if !conn.SetMtu(d.mtu) {
+		conn.Close()
 		return fmt.Errorf("setting MTU to %d", d.mtu)
 	}
 
-	// Put a Noise channel on top of the KCP conn.
 	var rw io.ReadWriteCloser = conn
 	if d.publicKey != nil {
-		// Put a Noise channel on top of the KCP conn.
+		// Bound the Noise handshake read so a silent tunnel can't block it
+		// forever; honor the caller's deadline when present, else a generous
+		// cap. Clear it before smux.Client starts its async recvLoop, so the
+		// conn's deadline is never mutated concurrently with a reader.
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(sessionHandshakeTimeout)
+		}
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			conn.Close()
+			return fmt.Errorf("setting handshake deadline: %w", err)
+		}
 		rw, err = noise.NewClient(conn, d.publicKey)
+		if derr := conn.SetReadDeadline(time.Time{}); derr != nil && err == nil {
+			err = derr
+		}
 		if err != nil {
+			conn.Close()
 			return fmt.Errorf("opening Noise channel: %w", err)
 		}
 	}
 
-	// Start a smux session
+	// Start a smux session. smux.Client starts an async recvLoop, so the conn's
+	// read deadline must not be changed after this point.
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = idleTimeout
 	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
-	d.sess, err = smux.Client(rw, smuxConfig)
+	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
+		conn.Close()
 		return fmt.Errorf("creating session: %w", err)
 	}
 
-	// check if dnstt is closed again before assigning the new session
-	if d.isClosed() {
-		d.sess.Close()
+	// Publish under the lock. If Close ran, or another goroutine won the race
+	// while we handshook, discard ours rather than leak it.
+	d.sessAccess.Lock()
+	defer d.sessAccess.Unlock()
+	if d.closed.Load() {
+		sess.Close()
+		conn.Close()
 		return errors.New("dnstt is closed")
 	}
-
+	if d.sess != nil && !d.sess.IsClosed() {
+		sess.Close()
+		conn.Close()
+		return nil
+	}
+	d.sess = sess
+	d.convID = conn.GetConv()
 	convID := d.convID
 	sessCtx, cancel := context.WithCancel(context.Background())
 	d.sessCancel = cancel
@@ -215,12 +251,12 @@ func (d *dnstt) maybeCreateSession() (err error) {
 		defer span.End()
 		<-sessCtx.Done()
 	}()
-	slog.Debug("begin session", "sessionID", fmt.Sprintf("%08x", d.convID))
+	slog.Debug("begin session", "sessionID", fmt.Sprintf("%08x", convID))
 	return nil
 }
 
-func (d *dnstt) getStream() (*smux.Stream, error) {
-	err := d.maybeCreateSession()
+func (d *dnstt) getStream(ctx context.Context) (*smux.Stream, error) {
+	err := d.maybeCreateSession(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
@@ -236,7 +272,7 @@ func (d *dnstt) getStream() (*smux.Stream, error) {
 		slog.Debug("session stream id overflowed, closing current session")
 		d.sess.Close()
 	}
-	err = d.maybeCreateSession()
+	err = d.maybeCreateSession(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("creating new session: %w", err)
 	}
@@ -270,7 +306,7 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 	inner := &http.Transport{
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			_, streamSpan := otel.Tracer(tracerName).Start(ctx, "dnstt.stream")
-			stream, err := d.getStream()
+			stream, err := d.getStream(ctx)
 			if err != nil {
 				streamSpan.RecordError(err)
 				streamSpan.SetStatus(codes.Error, err.Error())
@@ -313,9 +349,9 @@ func (d *dnstt) NewRoundTripper(ctx context.Context, addr string) (http.RoundTri
 		d.sessAccess.Unlock()
 	}
 	return &retryRoundTripper{
-		inner:            inner,
-		maxRetries:       maxRoundTripRetries,
-		resetSession:     resetSession,
+		inner:        inner,
+		maxRetries:   maxRoundTripRetries,
+		resetSession: resetSession,
 	}, nil
 }
 
